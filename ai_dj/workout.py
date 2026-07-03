@@ -29,6 +29,9 @@ from .selector import _log, choose_setlist
 
 BPM_TOLERANCES = (3.0, 5.0, 8.0)
 DEFAULT_EASY_PACE = 555  # 9:15/mi - conversational, per the Runna plan
+# Extra music beyond the workout's length so the playlist doesn't run out
+# during pauses (shoelaces, traffic lights, walking it off afterwards).
+PLAYLIST_PAD_SEC = 300
 
 # Energy envelope per segment kind (relaxed in steps when the pool runs dry).
 ENERGY_BOUNDS = {
@@ -241,6 +244,9 @@ def build_workout_playlist(
         if seg.pace_sec:
             seg.bpm = pace_to_bpm(seg.pace_sec, cadence_buckets)
 
+    # Pad the final segment so the playlist outlasts the workout a little.
+    segments[-1].duration_sec += PLAYLIST_PAD_SEC
+
     parts: list[pd.DataFrame] = []
     used: set = set()
     prev_tail: pd.DataFrame | None = None
@@ -282,11 +288,15 @@ def build_workout_playlist(
             ordered = pool.iloc[_chain_order(pool, prev_tail)]
 
         # Top up from the rest of the pool if the picks don't cover the budget.
+        # Compare by Track URI, not index — choose_setlist resets its result's
+        # index, so index-based exclusion would re-add already-picked tracks
+        # (duplicate index labels then make _fit_duration's .loc explode each
+        # pick into multiple rows).
         if ordered["Duration (ms)"].sum() / 1000 < budget:
-            leftover = pool[~pool.index.isin(ordered.index)]
+            leftover = pool[~pool["Track URI"].isin(ordered["Track URI"])].reset_index(drop=True)
             if not leftover.empty:
-                extra = leftover.iloc[_chain_order(leftover.reset_index(drop=True), ordered.tail(1))]
-                ordered = pd.concat([ordered, extra])
+                extra = leftover.iloc[_chain_order(leftover, ordered.tail(1))]
+                ordered = pd.concat([ordered, extra], ignore_index=True)
 
         chosen = _fit_duration(ordered, budget).copy()
         chosen["Segment"] = seg.label

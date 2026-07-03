@@ -47,7 +47,7 @@ app.config["MODEL"] = DEFAULT_MODEL
 
 def _load_library(csv_text: str) -> pd.DataFrame:
     df = pd.read_csv(io.StringIO(csv_text))
-    df = df.dropna(subset=["Tempo"]).reset_index(drop=True)
+    df = df.dropna(subset=["Tempo"]).drop_duplicates(subset=["Track URI"]).reset_index(drop=True)
     df["Camelot"] = [to_camelot(k, m) for k, m in zip(df["Key"], df["Mode"])]
     return df
 
