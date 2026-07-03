@@ -215,15 +215,17 @@ def _chain_order(pool: pd.DataFrame, anchor: pd.DataFrame | None) -> list[int]:
     return order
 
 
-def _fit_duration(ordered: pd.DataFrame, budget_sec: float) -> pd.DataFrame:
+def _fit_duration(ordered: pd.DataFrame, budget_sec: float, overshoot: bool = False) -> pd.DataFrame:
     """Keep tracks in order until the budget is met, landing the section end
     as close to the budget as possible: the track that crosses the boundary
-    is only kept when overshooting beats stopping short."""
+    is only kept when overshooting beats stopping short. With overshoot=True
+    the crossing track is always kept, so the section never ends early —
+    used for the final segment, whose budget is a minimum (workout + pad)."""
     picked, cum = [], 0.0
     for i, row in ordered.iterrows():
         dur = row["Duration (ms)"] / 1000
         if cum + dur >= budget_sec:
-            if not picked or (cum + dur - budget_sec) < (budget_sec - cum):
+            if overshoot or not picked or (cum + dur - budget_sec) < (budget_sec - cum):
                 picked.append(i)
             break
         picked.append(i)
@@ -253,8 +255,11 @@ def build_workout_playlist(
     carry = 0.0
 
     for seg in segments:
+        is_last = seg is segments[-1]
         budget = seg.duration_sec - carry
-        if budget <= 30:  # previous overshoot already covers this segment
+        # Previous overshoot already covers this segment (but the final
+        # segment's budget is a hard minimum — only skip it when fully covered).
+        if budget <= (0 if is_last else 30):
             carry = -budget
             continue
 
@@ -298,7 +303,7 @@ def build_workout_playlist(
                 extra = leftover.iloc[_chain_order(leftover, ordered.tail(1))]
                 ordered = pd.concat([ordered, extra], ignore_index=True)
 
-        chosen = _fit_duration(ordered, budget).copy()
+        chosen = _fit_duration(ordered, budget, overshoot=is_last).copy()
         chosen["Segment"] = seg.label
         chosen["Target BPM"] = seg.bpm
 
