@@ -166,24 +166,32 @@ def pace_to_bpm(pace_sec: float, cadence_buckets: dict[int, float] | None = None
 # ── Selection ────────────────────────────────────────────────────────────────
 
 def _segment_pool(
-    library: pd.DataFrame, seg: Segment, used: set, min_pool: int
+    library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float
 ) -> pd.DataFrame:
     e_lo, e_hi = ENERGY_BOUNDS[seg.kind]
-    chill = seg.kind in CHILL_KINDS
-    # Chill kinds hold the energy cap and let BPM drift (None = unfiltered);
-    # effort kinds keep BPM tight and pad the energy window open instead.
-    tolerances = BPM_TOLERANCES + (12.0, None) if chill else BPM_TOLERANCES
-    pads = (0.0, 0.05) if chill else (0.0, 0.1, 0.2, 1.0)
-    for tol in tolerances:
-        for pad in pads:
-            pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
-            pool = pool[
-                (pool["Energy"] >= max(e_lo - pad, 0))
-                & (pool["Energy"] <= min(e_hi + pad, 1))
-            ]
-            pool = pool[~pool["Track URI"].isin(used)] if "Track URI" in pool.columns else pool
-            if len(pool) >= min_pool:
-                return pool.reset_index(drop=True)
+    if seg.kind in CHILL_KINDS:
+        # Chill kinds hold the energy cap and let BPM drift (None = unfiltered)
+        # before the cap lifts — an easy run should get chilled tunes, not
+        # 172-BPM drum and bass that happens to match the cadence.
+        attempts = [
+            (tol, pad)
+            for pad in (0.0, 0.05, 0.15, 0.30, 0.45)
+            for tol in BPM_TOLERANCES + (12.0, None)
+        ]
+    else:
+        # Effort kinds keep BPM tight and pad the energy window open instead.
+        attempts = [(tol, pad) for tol in BPM_TOLERANCES for pad in (0.0, 0.1, 0.2, 1.0)]
+    for tol, pad in attempts:
+        pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
+        pool = pool[
+            (pool["Energy"] >= max(e_lo - pad, 0))
+            & (pool["Energy"] <= min(e_hi + pad, 1))
+        ]
+        pool = pool[~pool["Track URI"].isin(used)] if "Track URI" in pool.columns else pool
+        # The pool must be able to fill the whole segment — a 2h long run
+        # needs far more than min_pool tracks.
+        if len(pool) >= min_pool and pool["Duration (ms)"].sum() / 1000 >= budget_sec:
+            return pool.reset_index(drop=True)
     return pool.reset_index(drop=True)
 
 
@@ -244,7 +252,7 @@ def build_workout_playlist(
             carry = -budget
             continue
 
-        pool = _segment_pool(library, seg, used, min_pool=8)
+        pool = _segment_pool(library, seg, used, min_pool=8, budget_sec=budget)
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue
