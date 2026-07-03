@@ -1,0 +1,6 @@
+pandas
+numpy
+requests
+flask
+# optional: read tags when scanning --music-dir
+mutagen

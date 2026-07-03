@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-dj"
+version = "0.1.0"
+description = "Local AI DJ: natural-language prompts and Runna workouts to BPM-matched playlists. Companion service for the PaceSync running app."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas",
+    "numpy",
+    "requests",
+    "flask",
+]
+
+[project.optional-dependencies]
+tags = ["mutagen"]
+
+[project.scripts]
+ai-dj = "ai_dj.cli:main"
+
+[tool.setuptools]
+packages = ["ai_dj"]
