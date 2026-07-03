@@ -34,15 +34,21 @@ DEFAULT_EASY_PACE = 555  # 9:15/mi - conversational, per the Runna plan
 ENERGY_BOUNDS = {
     "warmup": (0.45, 0.85),
     "work": (0.60, 1.00),
+    "easy": (0.00, 0.55),
     "cooldown": (0.00, 0.60),
     "rest": (0.00, 0.50),
 }
+
+# Kinds where the energy cap outranks BPM matching: the cap stays firm and
+# the BPM tolerance widens (eventually off) instead — an easy run should get
+# chilled tunes, not 172-BPM drum and bass that happens to match the cadence.
+CHILL_KINDS = {"easy", "cooldown", "rest"}
 
 
 @dataclass
 class Segment:
     label: str
-    kind: str  # warmup | work | cooldown | rest
+    kind: str  # warmup | work | easy | cooldown | rest
     duration_sec: float
     pace_sec: float | None  # seconds per mile
     bpm: float | None = None
@@ -61,6 +67,8 @@ def _segment_kind(text: str) -> str:
         return "warmup"
     if "cool down" in t or "cooldown" in t:
         return "cooldown"
+    if "conversational" in t or "easy" in t or "recovery" in t:
+        return "easy"
     return "work"
 
 
@@ -101,7 +109,12 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
             duration = int(dur_m.group(1)) * 60 if dur_m else 0
 
         if duration > 0:
-            segments.append(Segment(run_part, _segment_kind(run_part), duration, pace))
+            kind = _segment_kind(run_part)
+            # A step with no stated pace runs at the conversational default —
+            # treat it as easy effort, not a hard "work" interval.
+            if kind == "work" and not pace_m:
+                kind = "easy"
+            segments.append(Segment(run_part, kind, duration, pace))
 
         if rest_m:
             value = int(rest_m.group(1))
@@ -127,11 +140,13 @@ def garmin_cadence_buckets(db_path: str) -> dict[int, float]:
     """5-second pace bucket -> avg SPM, same query the Running app uses."""
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as con:
         rows = con.execute(
-            """SELECT CAST(3600.0 / speed / 5 AS INTEGER) * 5 AS bucket,
-                      AVG(cadence * 2) AS avg_spm
-               FROM activity_records
-               WHERE speed > 0.3 AND speed IS NOT NULL
-                 AND cadence IS NOT NULL AND cadence > 10
+            """SELECT CAST(3600.0 / r.speed / 5 AS INTEGER) * 5 AS bucket,
+                      AVG(r.cadence * 2) AS avg_spm
+               FROM activity_records r
+               JOIN activities a ON a.activity_id = r.activity_id
+               WHERE LOWER(a.sport) LIKE '%running%'
+                 AND r.speed > 0.3 AND r.speed IS NOT NULL
+                 AND r.cadence IS NOT NULL AND r.cadence > 10
                GROUP BY bucket HAVING bucket BETWEEN 390 AND 600
                ORDER BY bucket"""
         ).fetchall()
@@ -143,8 +158,9 @@ def pace_to_bpm(pace_sec: float, cadence_buckets: dict[int, float] | None = None
         bucket = min(cadence_buckets, key=lambda b: abs(b - pace_sec))
         if abs(bucket - pace_sec) <= 15:
             return round(cadence_buckets[bucket])
-    # Linear fit to the app's observed cadence chips: 555s->172, 515s->173, 475s->174.
-    return round(min(max(174 + (475 - pace_sec) / 40, 165.0), 182.0))
+    # Fit to measured FIT-file cadence: 171 spm @ 9:15/mi, ~1 spm per 30 s/mi
+    # (cadence barely moves with pace; stride length does the work).
+    return round(min(max(171 + (555 - pace_sec) / 30, 164.0), 180.0))
 
 
 # ── Selection ────────────────────────────────────────────────────────────────
@@ -153,9 +169,14 @@ def _segment_pool(
     library: pd.DataFrame, seg: Segment, used: set, min_pool: int
 ) -> pd.DataFrame:
     e_lo, e_hi = ENERGY_BOUNDS[seg.kind]
-    for tol in BPM_TOLERANCES:
-        for pad in (0.0, 0.1, 0.2, 1.0):
-            pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm else library
+    chill = seg.kind in CHILL_KINDS
+    # Chill kinds hold the energy cap and let BPM drift (None = unfiltered);
+    # effort kinds keep BPM tight and pad the energy window open instead.
+    tolerances = BPM_TOLERANCES + (12.0, None) if chill else BPM_TOLERANCES
+    pads = (0.0, 0.05) if chill else (0.0, 0.1, 0.2, 1.0)
+    for tol in tolerances:
+        for pad in pads:
+            pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
             pool = pool[
                 (pool["Energy"] >= max(e_lo - pad, 0))
                 & (pool["Energy"] <= min(e_hi + pad, 1))
@@ -240,6 +261,7 @@ def build_workout_playlist(
                 + {
                     "warmup": "Easing in - upbeat but not full throttle.",
                     "work": "Hard effort - driving, motivating, relentless.",
+                    "easy": "Conversational effort - chilled, laid-back, mellow; nothing aggressive or high-energy.",
                     "cooldown": "Winding down - relaxed and light.",
                     "rest": "Recovery - calm.",
                 }[seg.kind]

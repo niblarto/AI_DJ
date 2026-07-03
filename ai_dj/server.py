@@ -13,7 +13,10 @@ POST /mix
       "segments": ["1mi warm up ...", "1.5mi at 8:35/mi", ...],
       "csv": "<Exportify CSV text>",
       "easyPace": "9:15",              // optional
-      "useLlm": true                   // optional
+      "useLlm": true,                  // optional
+      "cadenceBuckets": {"555": 171}   // optional: sec/mi pace bucket -> SPM,
+                                       // from the caller's GarminDB (the
+                                       // service host has no Garmin data)
     }
 ->  {
       "trackUris": ["spotify:track:...", ...],
@@ -88,10 +91,19 @@ def mix():
     if not segments:
         return jsonify({"error": "No runnable segments recognized in the workout"}), 400
 
+    buckets = None
+    raw_buckets = body.get("cadenceBuckets")
+    if isinstance(raw_buckets, dict):
+        try:
+            buckets = {int(k): float(v) for k, v in raw_buckets.items()} or None
+        except (TypeError, ValueError):
+            buckets = None
+
     use_llm = app.config["USE_LLM"] and body.get("useLlm", True)
     try:
         playlist = build_workout_playlist(
-            segments, library, model=app.config["MODEL"], use_llm=use_llm
+            segments, library, model=app.config["MODEL"], use_llm=use_llm,
+            cadence_buckets=buckets,
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 422
