@@ -18,11 +18,11 @@ in Ollama on the local GPU.
 ```
 Exportify CSV or scanned folder ──▶ bpm_matcher (Tempo/Camelot/Energy/Dance/Valence)
                         │
-prompt ──▶ Qwen 2.5 7B: extract constraints (BPM range, energy, count)
+prompt ──▶ LLM (Ollama): extract constraints (BPM range, energy, count)
                         │
-                bpm_filter + energy filter ──▶ candidate pool (≤120)
+                bpm_filter + energy filter ──▶ candidate pool (≤140)
                         │
-           Qwen 2.5 7B: pick & order the setlist
+           LLM (Ollama): pick & order the setlist
                         │
         [--smooth / --arc] reorder via bpm_matcher distance
                         │
@@ -35,8 +35,16 @@ prompt ──▶ Qwen 2.5 7B: extract constraints (BPM range, energy, count)
 
 1. **Ollama** — install from https://ollama.com/download/windows, then:
    ```
-   ollama pull qwen2.5:7b
+   ollama pull mistral-nemo:12b
    ```
+   Default model is `mistral-nemo:12b` (better constraint extraction and
+   energy-arc quality than `qwen2.5:7b` in side-by-side testing, at ~2x the
+   latency from partial GPU/CPU split on a 10GB card - `qwen2.5:7b` is
+   noticeably faster if that trade isn't worth it: `ollama pull qwen2.5:7b`
+   then set `AI_DJ_MODEL=qwen2.5:7b` or pass `--model qwen2.5:7b`). On a
+   10GB GPU, `mistral-nemo:12b` needs `num_ctx` capped around 8192 to stay
+   fully on-GPU; the pipeline's default 16384 spills ~15% to CPU, which is
+   the accepted tradeoff for the larger candidate pool below.
 2. **Python deps** — `pip install -r requirements.txt` (or reuse the AI_BPM
    venv, which already has everything except mutagen).
 3. **bpm_matcher** — expected at `E:\Code\AI_BPM`; override with the
@@ -60,7 +68,7 @@ Options:
 | `-n N` | Force track count (default: inferred from prompt, else 15) |
 | `--music-dir DIR` | Also scan this folder for local audio files |
 | `--mixxxdb PATH` | Mixxx database (default: `%LOCALAPPDATA%\Mixxx\mixxxdb.sqlite`) |
-| `--model NAME` | Ollama model (default `qwen2.5:7b`, or `AI_DJ_MODEL` env var) |
+| `--model NAME` | Ollama model (default `mistral-nemo:12b`, or `AI_DJ_MODEL` env var) |
 | `--smooth` | Reorder the picks by weighted BPM/key/feel distance for smoother transitions |
 | `--arc` | Reorder as a rising energy arc (mellow opener → peak-energy closer) |
 

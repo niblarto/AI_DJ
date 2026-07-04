@@ -18,7 +18,7 @@ from bpm_matcher.match import bpm_filter, cross_distance_matrix
 
 from .llm import chat_json
 
-MAX_CANDIDATES = 120
+MAX_CANDIDATES = 140
 
 _CONSTRAINTS_SYSTEM = """\
 You extract DJ-set constraints from a request. Reply with ONLY a JSON object:
