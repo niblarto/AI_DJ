@@ -244,7 +244,7 @@ def generate():
             "name": row["Track Name"],
             "artist": row["Artist Name(s)"],
             "bpm": float(row["Tempo"]),
-            "camelot": row["Camelot"] or "?",
+            "camelot": row["Camelot"] if isinstance(row["Camelot"], str) else "?",
             "energy": float(row["Energy"]),
             "durationMs": float(row["Duration (ms)"]) if pd.notna(row.get("Duration (ms)")) else None,
             "location": row["Location"] if isinstance(row.get("Location"), str) else None,

@@ -17,10 +17,11 @@ from .selector import build_setlist
 
 
 def _format_track(row) -> str:
-    loc = " [file found]" if row.get("Location") else ""
+    loc = " [file found]" if isinstance(row.get("Location"), str) else ""
+    camelot = row["Camelot"] if isinstance(row["Camelot"], str) else "?"
     return (
         f"{row['Track Name']} — {row['Artist Name(s)']} "
-        f"({row['Tempo']:.0f} BPM, {row['Camelot'] or '?'}, energy {row['Energy']:.2f}){loc}"
+        f"({row['Tempo']:.0f} BPM, {camelot}, energy {row['Energy']:.2f}){loc}"
     )
 
 

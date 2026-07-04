@@ -166,6 +166,18 @@ profile into the service environment (services run as LocalSystem, whose
 `%LOCALAPPDATA%` would otherwise miss your Mixxx DB). Edit the paths at the
 top of the script for your machine first. Re-running it is idempotent.
 
+## Streaming the set (Icecast)
+
+`install-icecast.ps1` (elevated) installs [Icecast 2](https://icecast.org)
+and registers it as the auto-starting `IcecastService` on port 8000 (firewall
+opened), so Mixxx can live-broadcast and any device on the LAN can listen:
+
+- Mixxx: *Preferences → Live Broadcasting* — Type `Icecast 2`, Host
+  `localhost`, Port `8000`, Mount `/mixxx`, Login `source`, plus the source
+  password you chose at install (`-SourcePassword`; stored in `.env.local`).
+- Listen on any device at `http://<pc-ip>:8000/mixxx` (VLC, a browser, or a
+  radio app). Status page: `http://<pc-ip>:8000/`.
+
 ## Playing the set in Mixxx
 
 Library sidebar → Playlists → right-click → *Import Playlist* → pick the

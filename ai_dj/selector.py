@@ -116,9 +116,10 @@ def filter_candidates(
 def _format_pool(pool: pd.DataFrame) -> str:
     lines = []
     for i, row in pool.iterrows():
+        camelot = row["Camelot"] if isinstance(row["Camelot"], str) else "?"
         lines.append(
             f"{i}. {row['Track Name']} — {row['Artist Name(s)']} | "
-            f"{row['Tempo']:.0f} BPM | {row['Camelot'] or '?'} | "
+            f"{row['Tempo']:.0f} BPM | {camelot} | "
             f"energy {row['Energy']:.2f} | dance {row['Danceability']:.2f} | "
             f"mood {row['Valence']:.2f}"
         )
