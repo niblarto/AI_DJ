@@ -99,27 +99,39 @@ def mix():
         except (TypeError, ValueError):
             buckets = None
 
+    try:
+        easy_bias = float(body.get("easyBias") or 0.0)
+    except (TypeError, ValueError):
+        easy_bias = 0.0
+
+    feedback = body.get("trackFeedback")
+    if not isinstance(feedback, list):
+        feedback = None
+
     use_llm = app.config["USE_LLM"] and body.get("useLlm", True)
     try:
         playlist = build_workout_playlist(
             segments, library, model=app.config["MODEL"], use_llm=use_llm,
-            cadence_buckets=buckets,
+            cadence_buckets=buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 422
 
     timeline = []
     for seg_label, group in playlist.groupby("Segment", sort=False):
+        target_pace = group["Target Pace"].iloc[0] if "Target Pace" in group.columns else None
         timeline.append(
             {
                 "segment": seg_label,
                 "targetBpm": float(group["Target BPM"].iloc[0]),
+                "targetPaceSec": float(target_pace) if pd.notna(target_pace) else None,
                 "tracks": [
                     {
                         "uri": row.get("Track URI"),
                         "name": row["Track Name"],
                         "artist": row["Artist Name(s)"],
                         "startsAt": row["Starts At"],
+                        "durationSec": float(row["Duration (ms)"] / 1000),
                         "tempo": float(row["Tempo"]),
                         "camelot": row["Camelot"],
                         "energy": float(row["Energy"]),

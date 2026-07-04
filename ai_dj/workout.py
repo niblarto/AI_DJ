@@ -47,6 +47,11 @@ ENERGY_BOUNDS = {
 # chilled tunes, not 172-BPM drum and bass that happens to match the cadence.
 CHILL_KINDS = {"easy", "cooldown", "rest"}
 
+# Thumbs up/down from the app applies to paces within this window (sec/mi):
+# a downvoted track is excluded from segments near that pace, an upvoted one
+# is pulled to the front of the segment's setlist.
+FEEDBACK_PACE_TOLERANCE = 10.0
+
 
 @dataclass
 class Segment:
@@ -169,9 +174,14 @@ def pace_to_bpm(pace_sec: float, cadence_buckets: dict[int, float] | None = None
 # ── Selection ────────────────────────────────────────────────────────────────
 
 def _segment_pool(
-    library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float
+    library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float,
+    easy_bias_sec: float = 0.0,
 ) -> pd.DataFrame:
     e_lo, e_hi = ENERGY_BOUNDS[seg.kind]
+    # Runner has been going faster than target on easy runs — calm the music
+    # down further: ~0.05 off the energy ceiling per 10 s/mi of overshoot.
+    if seg.kind in CHILL_KINDS and easy_bias_sec > 0:
+        e_hi = max(0.35, e_hi - min(0.15, easy_bias_sec * 0.005))
     if seg.kind in CHILL_KINDS:
         # Chill kinds hold the energy cap and let BPM drift (None = unfiltered)
         # before the cap lifts — an easy run should get chilled tunes, not
@@ -239,12 +249,29 @@ def build_workout_playlist(
     model: str,
     use_llm: bool = True,
     cadence_buckets: dict[int, float] | None = None,
+    easy_bias_sec: float = 0.0,
+    track_feedback: list[dict] | None = None,
 ) -> pd.DataFrame:
     """Fill every segment with BPM-matched tracks; returns rows with a
-    Segment label and cumulative timing columns."""
+    Segment label and cumulative timing columns.
+
+    track_feedback: [{"uri", "paceSec", "vote": "up"|"down"}] — downvoted
+    tracks are dropped from segments whose pace is within
+    FEEDBACK_PACE_TOLERANCE of the vote's pace; upvoted ones are moved to
+    the front of that segment's setlist so they play more often.
+
+    easy_bias_sec > 0 means recent easy runs came out that much faster than
+    target (sec/mi): easy-type segments are then built as if their pace were
+    that much slower (lower SPM) with a lower energy ceiling. Easy pace is a
+    ceiling ("no faster than"), so the bias only ever slows the music down.
+    """
+    easy_bias_sec = min(max(easy_bias_sec, 0.0), 30.0)
     for seg in segments:
         if seg.pace_sec:
-            seg.bpm = pace_to_bpm(seg.pace_sec, cadence_buckets)
+            pace = seg.pace_sec
+            if seg.kind in CHILL_KINDS:
+                pace += easy_bias_sec
+            seg.bpm = pace_to_bpm(pace, cadence_buckets)
 
     # Pad the final segment so the playlist outlasts the workout a little.
     segments[-1].duration_sec += PLAYLIST_PAD_SEC
@@ -253,6 +280,15 @@ def build_workout_playlist(
     used: set = set()
     prev_tail: pd.DataFrame | None = None
     carry = 0.0
+
+    def _feedback_uris(pace_sec, vote):
+        if not track_feedback or not pace_sec:
+            return set()
+        return {
+            f.get("uri") for f in track_feedback
+            if f.get("vote") == vote and f.get("uri")
+            and abs(float(f.get("paceSec") or 0) - pace_sec) <= FEEDBACK_PACE_TOLERANCE
+        }
 
     for seg in segments:
         is_last = seg is segments[-1]
@@ -263,7 +299,9 @@ def build_workout_playlist(
             carry = -budget
             continue
 
-        pool = _segment_pool(library, seg, used, min_pool=8, budget_sec=budget)
+        downvoted = _feedback_uris(seg.pace_sec, "down")
+        lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
+        pool = _segment_pool(lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec)
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue
@@ -303,9 +341,17 @@ def build_workout_playlist(
                 extra = leftover.iloc[_chain_order(leftover, ordered.tail(1))]
                 ordered = pd.concat([ordered, extra], ignore_index=True)
 
+        # Upvoted-at-this-pace tracks lead the segment so they make the cut.
+        boosted = _feedback_uris(seg.pace_sec, "up")
+        if boosted:
+            is_boost = ordered["Track URI"].isin(boosted)
+            if is_boost.any():
+                ordered = pd.concat([ordered[is_boost], ordered[~is_boost]])
+
         chosen = _fit_duration(ordered, budget, overshoot=is_last).copy()
         chosen["Segment"] = seg.label
         chosen["Target BPM"] = seg.bpm
+        chosen["Target Pace"] = seg.pace_sec  # sec/mi, for post-run pace review
 
         actual = chosen["Duration (ms)"].sum() / 1000
         carry = actual - budget
