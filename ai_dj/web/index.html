@@ -149,40 +149,44 @@
       <h2>Track sources</h2>
       <label>Library CSV (Exportify export)</label>
       <div class="pathrow">
-        <input type="text" id="csv" placeholder="E:/Code/AI_BPM/data/Running.csv">
+        <input type="text" id="csv" placeholder="E:\Code\AI_BPM\data\Running.csv">
         <button type="button" class="browse" data-target="csv" data-ext=".csv">Browse…</button>
       </div>
+      <details class="details">
+        <summary>Build a library from a music folder (scan)</summary>
+        <label>Music folder to scan recursively</label>
+        <div class="pathrow">
+          <input type="text" id="scanDir" placeholder="D:\Tunes">
+          <button type="button" class="browse" data-target="scanDir">Browse…</button>
+        </div>
+        <label>Save library CSV as (blank = ai_dj_library.csv inside the folder)</label>
+        <div class="pathrow">
+          <input type="text" id="scanOut" placeholder="D:\Tunes\ai_dj_library.csv">
+          <button type="button" class="browse" data-target="scanOut" data-ext=".csv" data-dir="1">Browse…</button>
+        </div>
+        <div class="pathrow" style="margin-top:12px; align-items:center">
+          <button type="button" class="browse" id="scanGo" style="padding:9px 18px">Scan folder</button>
+          <span id="scanStatus" style="color:var(--dim); font-size:13px"></span>
+        </div>
+      </details>
       <details class="details">
         <summary>Local file resolution (Mixxx DB / music folder)</summary>
         <label>Mixxx database</label>
         <div class="pathrow">
-          <input type="text" id="mixxxdb" placeholder="%LOCALAPPDATA%/Mixxx/mixxxdb.sqlite">
+          <input type="text" id="mixxxdb" placeholder="%LOCALAPPDATA%\Mixxx\mixxxdb.sqlite">
           <button type="button" class="browse" data-target="mixxxdb" data-ext=".sqlite">Browse…</button>
         </div>
         <label>Music folder to scan (optional)</label>
         <div class="pathrow">
-          <input type="text" id="musicDir" placeholder="E:/Music">
+          <input type="text" id="musicDir" placeholder="E:\Music">
           <button type="button" class="browse" data-target="musicDir">Browse…</button>
         </div>
         <label>Ollama model</label>
         <input type="text" id="model" placeholder="qwen2.5:7b">
       </details>
-    </div>
-
-    <div class="card">
-      <h2>Output</h2>
-      <div class="row">
-        <div>
-          <label>Folder</label>
-          <div class="pathrow">
-            <input type="text" id="outDir" placeholder="C:/Users/you/Music/AI_DJ">
-            <button type="button" class="browse" data-target="outDir">Browse…</button>
-          </div>
-        </div>
-        <div>
-          <label>Filename (blank = preview only, no file)</label>
-          <input type="text" id="filename" placeholder="friday-warmup.m3u8">
-        </div>
+      <div class="pathrow" style="margin-top:14px; align-items:center">
+        <button type="button" class="browse" id="savePaths" style="padding:9px 18px">Save paths</button>
+        <span id="savePathsStatus" style="color:var(--dim); font-size:13px">remembers these paths and the model for next time</span>
       </div>
     </div>
 
@@ -195,6 +199,13 @@
   <div class="card" id="results">
     <h2>Setlist</h2>
     <p class="summary" id="summary"></p>
+    <div class="pathrow" id="saveRow" style="display:none; margin-bottom:6px">
+      <input type="text" id="saveDir" placeholder="C:\Users\you\Music\AI_DJ">
+      <button type="button" class="browse" data-target="saveDir">Browse…</button>
+      <input type="text" id="saveName" placeholder="friday-warmup.m3u8" style="max-width:240px">
+      <button type="button" class="browse" id="saveGo">Save M3U</button>
+    </div>
+    <p id="saveStatus" style="color:var(--dim); font-size:13px; margin:0 0 14px"></p>
     <p class="notes" id="notes"></p>
     <div style="overflow-x:auto"><table>
       <thead><tr><th>#</th><th>Track</th><th>Artist</th><th class="num">BPM</th><th>Key</th><th class="num">Energy</th><th class="num">Length</th><th>File</th></tr></thead>
@@ -227,10 +238,11 @@ function setSizeMode(m) {
   $("modeMinutes").classList.toggle("active", m === "minutes");
   $("sizeValue").placeholder = m === "tracks" ? "15" : "45";
 }
-document.querySelectorAll("[data-order]").forEach(b => b.onclick = () => {
-  order = b.dataset.order;
-  document.querySelectorAll("[data-order]").forEach(x => x.classList.toggle("active", x === b));
-});
+document.querySelectorAll("[data-order]").forEach(b => b.onclick = () => setOrderVal(b.dataset.order));
+function setOrderVal(v) {
+  order = v;
+  document.querySelectorAll("[data-order]").forEach(x => x.classList.toggle("active", x.dataset.order === v));
+}
 
 // ---- style toggles ---------------------------------------------------
 // Each toggle appends a directive phrase to the prompt. `x` marks an
@@ -275,6 +287,7 @@ const TOGGLES = [
     ["Euphoric", "euphoric, hands-in-the-air moments"],
   ]],
   ["Selection", [
+    ["No-Repeat-Artists", ""],  // enforced in code, not via the prompt
     ["Hidden-Gems", "prefer lesser-known tracks and deep cuts over the obvious picks"],
     ["Classics", "prefer well-known, recognizable tracks"],
     ["Fresh-Finds", "prefer newer releases over older material"],
@@ -302,6 +315,7 @@ const TOGGLES = [
 ];
 
 const active = new Map();  // label -> phrase
+const chipEls = {};        // label -> chip element (for restoring saved state)
 const tglRoot = $("toggles");
 TOGGLES.forEach(([gname, items]) => {
   const g = document.createElement("div");
@@ -326,6 +340,7 @@ TOGGLES.forEach(([gname, items]) => {
         : "Optional — shape tempo, key, energy, vibe and structure";
     };
     if (excl) c.dataset.excl = excl;
+    chipEls[label] = c;
     chips.appendChild(c);
   });
   g.appendChild(chips);
@@ -334,19 +349,43 @@ TOGGLES.forEach(([gname, items]) => {
 
 function styledPrompt() {
   const base = $("prompt").value.trim();
-  if (!active.size) return base;
-  return base + "\nStyle directives: " + [...active.values()].join("; ") + ".";
+  const phrases = [...active.values()].filter(Boolean);
+  if (!phrases.length) return base;
+  return base + "\nStyle directives: " + phrases.join("; ") + ".";
 }
 
-fetch("/api/defaults").then(r => r.json()).then(d => {
-  if (d.csv) $("csv").value = d.csv;
-  if (d.mixxxdb) $("mixxxdb").value = d.mixxxdb;
-  if (d.outDir) $("outDir").value = d.outDir;
-  if (d.model) $("model").placeholder = d.model;
-  const s = $("llmStatus");
-  s.classList.add(d.llm ? "on" : "off");
-  s.innerHTML = '<span class="led"></span>' + (d.llm ? "Ollama connected" : "Ollama unreachable");
-}).catch(() => {});
+const PATH_FIELDS = ["csv", "mixxxdb", "musicDir", "scanDir", "scanOut", "saveDir", "model"];
+
+(async () => {
+  try {
+    const d = await (await fetch("/api/defaults")).json();
+    if (d.csv) $("csv").value = d.csv;
+    if (d.mixxxdb) $("mixxxdb").value = d.mixxxdb;
+    if (d.outDir) $("saveDir").value = d.outDir;
+    if (d.model) $("model").placeholder = d.model;
+    const s = $("llmStatus");
+    s.classList.add(d.llm ? "on" : "off");
+    s.innerHTML = '<span class="led"></span>' + (d.llm ? "Ollama connected" : "Ollama unreachable");
+  } catch {}
+  try {
+    const s = await (await fetch("/api/settings")).json();
+    PATH_FIELDS.forEach(id => { if (s.paths && s.paths[id]) $(id).value = s.paths[id]; });
+    if (s.prompt) $("prompt").value = s.prompt;
+    if (s.sizeMode) setSizeMode(s.sizeMode);
+    if (s.sizeValue) $("sizeValue").value = s.sizeValue;
+    if (s.order) setOrderVal(s.order);
+    (s.toggles || []).forEach(label => {
+      const c = chipEls[label];
+      if (c && !c.classList.contains("on")) c.click();
+    });
+    if ((s.toggles || []).length) $("tglDetails").open = true;
+  } catch {}
+})();
+
+const saveSettings = patch =>
+  fetch("/api/settings", {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch),
+  }).catch(() => {});
 
 $("form").onsubmit = async e => {
   e.preventDefault();
@@ -360,10 +399,18 @@ $("form").onsubmit = async e => {
     musicDir: $("musicDir").value,
     model: $("model").value,
     order,
-    outDir: $("outDir").value,
-    filename: $("filename").value,
+    uniqueArtists: active.has("No-Repeat-Artists"),
   };
   if (!isNaN(size) && size > 0) body[sizeMode === "tracks" ? "tracks" : "minutes"] = size;
+
+  // Remember what was asked for, so a refresh doesn't lose it.
+  saveSettings({
+    prompt: $("prompt").value,
+    toggles: [...active.keys()],
+    sizeMode,
+    sizeValue: $("sizeValue").value,
+    order,
+  });
 
   $("go").disabled = true; $("spin").classList.add("on");
   try {
@@ -400,14 +447,13 @@ function render(data) {
       `<td>${t.location ? "&#10003;" : "missing"}</td>`;
     rows.appendChild(tr);
   });
-  let summary = `${data.tracks.length} tracks, ${Math.round(data.totalMin)} min.`;
-  if (data.wrote) {
-    summary += ` Wrote <b>${esc(data.wrote.path)}</b> — <span class="ok">${data.wrote.resolved} playable</span>`;
-    if (data.wrote.missing) summary += `, <span class="miss">${data.wrote.missing} missing locally</span>`;
-    summary += ".";
-  } else {
-    summary += " Preview only — set a filename to write the M3U.";
-  }
+  const playable = data.tracks.filter(t => t.location).length;
+  const missing = data.tracks.length - playable;
+  let summary = `${data.tracks.length} tracks, ${Math.round(data.totalMin)} min — ` +
+    `<span class="ok">${playable} playable</span>` +
+    (missing ? `, <span class="miss">${missing} missing locally</span>` : "") + ".";
+  $("saveRow").style.display = "flex";
+  $("saveStatus").textContent = "";
   $("summary").innerHTML = summary;
   $("notes").textContent = data.reasoning ? "DJ notes: " + data.reasoning : "";
   $("results").style.display = "block";
@@ -416,14 +462,90 @@ function render(data) {
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+// ---- save current paths -----------------------------------------------
+$("savePaths").onclick = async () => {
+  const paths = {};
+  PATH_FIELDS.forEach(id => { paths[id] = $(id).value.trim(); });
+  await saveSettings({paths});
+  $("savePathsStatus").textContent = "Saved — these fields will be restored next time.";
+};
+
+// ---- save a previewed mix ---------------------------------------------
+$("saveGo").onclick = async () => {
+  const filename = $("saveName").value.trim();
+  if (!filename) { $("saveStatus").textContent = "Enter a filename."; return; }
+  $("saveGo").disabled = true;
+  try {
+    const resp = await fetch("/api/save", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({outDir: $("saveDir").value, filename}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error);
+    $("saveStatus").textContent = `Wrote ${data.path} — ${data.resolved} playable` +
+      (data.missing ? `, ${data.missing} missing` : "");
+  } catch (err) {
+    $("saveStatus").textContent = err.message;
+  } finally {
+    $("saveGo").disabled = false;
+  }
+};
+
+// ---- folder scan -> library CSV ---------------------------------------
+function scanMsg(text, isError) {
+  $("scanStatus").textContent = text;
+  $("scanStatus").style.color = isError ? "var(--err)" : "var(--dim)";
+}
+
+$("scanGo").onclick = async () => {
+  const dir = $("scanDir").value.trim();
+  if (!dir) { scanMsg("Enter or browse to a music folder first.", true); return; }
+  $("scanGo").disabled = true;
+  scanMsg("Starting…");
+  try {
+    const resp = await fetch("/api/scan", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({musicDir: dir, outCsv: $("scanOut").value.trim()}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error);
+    pollScan();
+  } catch (err) {
+    scanMsg(err.message, true);
+    $("scanGo").disabled = false;
+  }
+};
+
+async function pollScan() {
+  let s;
+  try { s = await (await fetch("/api/scan/status")).json(); }
+  catch { setTimeout(pollScan, 3000); return; }
+  if (s.running) {
+    scanMsg(`${s.done}/${s.total} — ${s.msg}`);
+    setTimeout(pollScan, 1500);
+    return;
+  }
+  $("scanGo").disabled = false;
+  if (s.error) { scanMsg("Scan failed: " + s.error, true); return; }
+  if (s.stats) {
+    const st = s.stats;
+    scanMsg(
+      `Done: ${st.added} added (${st.enriched} online, ${st.analyzed} analyzed, ${st.fallback} local BPM), ` +
+      `${st.unresolved} unresolved. Library: ${st.libraryTotal} tracks.`);
+    $("csv").value = st.out;  // use the scanned library as the source
+  }
+}
+
 // ---- path picker -----------------------------------------------------
 let pickTarget = null, pickExt = "", pickDir = "";
 
-document.querySelectorAll(".browse").forEach(b => b.onclick = () => {
+document.querySelectorAll(".browse[data-target]").forEach(b => b.onclick = () => {
   pickTarget = $(b.dataset.target);
   pickExt = b.dataset.ext || "";
-  $("pickerTitle").textContent = pickExt ? `Choose a ${pickExt} file` : "Choose a folder";
-  $("pickerSelect").style.display = pickExt ? "none" : "";
+  const allowDir = !pickExt || b.dataset.dir;
+  $("pickerTitle").textContent = !pickExt ? "Choose a folder"
+    : allowDir ? `Choose a folder or ${pickExt} file` : `Choose a ${pickExt} file`;
+  $("pickerSelect").style.display = allowDir ? "" : "none";
   // Start from the field's current folder if it has one.
   const cur = pickTarget.value.trim();
   const start = cur ? cur.replace(/[\\/][^\\/]*\.[^\\/]*$/, "") : "";

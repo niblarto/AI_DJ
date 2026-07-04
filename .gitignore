@@ -13,3 +13,6 @@ service*.log
 *.m3u8
 /steady-into-tempo.csv
 mix*.csv
+
+# Machine-local secrets
+.env.local

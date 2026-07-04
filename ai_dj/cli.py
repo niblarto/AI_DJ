@@ -38,6 +38,11 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default: {DEFAULT_MODEL}).")
     parser.add_argument("--smooth", action="store_true", help="Reorder picks for smoothest transitions.")
     parser.add_argument(
+        "--unique-artists",
+        action="store_true",
+        help="Never pick two tracks by the same artist.",
+    )
+    parser.add_argument(
         "--arc",
         action="store_true",
         help="Reorder as a rising energy arc (mellow opener to peak-energy closer) instead of plain smoothing.",
@@ -46,7 +51,8 @@ def main():
 
     library = load_playlist(args.csv)
     setlist, reasoning = build_setlist(
-        args.prompt, library, n=args.n, model=args.model, smooth=args.smooth, arc=args.arc
+        args.prompt, library, n=args.n, model=args.model, smooth=args.smooth, arc=args.arc,
+        unique_artists=args.unique_artists,
     )
     setlist = resolve_locations(setlist, music_dir=args.music_dir, mixxxdb=args.mixxxdb)
 

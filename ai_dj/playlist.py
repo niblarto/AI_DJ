@@ -15,7 +15,8 @@ def write_m3u(setlist: pd.DataFrame, out_path: str) -> tuple[int, int]:
         seconds = int(row["Duration (ms)"] / 1000) if "Duration (ms)" in row and pd.notna(row.get("Duration (ms)")) else -1
         title = f"{row['Artist Name(s)']} - {row['Track Name']}"
         location = row.get("Location")
-        if location:
+        # NaN (pandas' None) is truthy - only a real string is a usable path.
+        if isinstance(location, str) and location:
             lines.append(f"#EXTINF:{seconds},{title}")
             lines.append(str(location))
             resolved += 1

@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tags = ["mutagen"]
+analysis = ["librosa"]
 
 [project.scripts]
 ai-dj = "ai_dj.cli:main"

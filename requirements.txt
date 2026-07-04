@@ -4,3 +4,5 @@ requests
 flask
 # optional: read tags when scanning --music-dir
 mutagen
+# optional: offline BPM/key/energy analysis in the library scanner
+librosa

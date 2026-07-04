@@ -176,12 +176,15 @@ def _parse_picks(raw: dict, pool: pd.DataFrame) -> list[int]:
     return picks
 
 
-def choose_setlist(prompt: str, pool: pd.DataFrame, count: int, model: str) -> tuple[pd.DataFrame, str]:
+def choose_setlist(
+    prompt: str, pool: pd.DataFrame, count: int, model: str, unique_artists: bool = False
+) -> tuple[pd.DataFrame, str]:
     """Ask the model to pick and order `count` tracks from the pool."""
     user = (
         f"Request: {prompt}\n"
-        f"Pick exactly {count} tracks.\n\n"
-        f"Candidates:\n{_format_pool(pool)}"
+        f"Pick exactly {count} tracks.\n"
+        + ("Use each artist at most once - no two tracks by the same artist.\n" if unique_artists else "")
+        + f"\nCandidates:\n{_format_pool(pool)}"
     )
     raw = chat_json(_SETLIST_SYSTEM, user, model=model, temperature=0.4)
     picks = _parse_picks(raw, pool)
@@ -198,6 +201,42 @@ def choose_setlist(prompt: str, pool: pd.DataFrame, count: int, model: str) -> t
 
     setlist = pool.iloc[picks[:count]].reset_index(drop=True)
     return setlist, str(raw.get("reasoning", ""))
+
+
+def _row_artists(row) -> list[str]:
+    return [a.strip().lower() for a in str(row["Artist Name(s)"]).split(";") if a.strip()]
+
+
+def enforce_unique_artists(setlist: pd.DataFrame, pool: pd.DataFrame, count: int) -> pd.DataFrame:
+    """Drop repeat-artist picks (any shared artist counts, so collabs block
+    both names), then top the set back up from unused pool tracks by fresh
+    artists, keeping pool order (BPM-closest first when the pool was narrowed).
+    """
+    seen: set[str] = set()
+    keep = []
+    for i, row in setlist.iterrows():
+        artists = _row_artists(row)
+        if any(a in seen for a in artists):
+            continue
+        seen.update(artists)
+        keep.append(i)
+    result = setlist.loc[keep]
+
+    if len(result) < count:
+        picked = set(zip(result["Artist Name(s)"], result["Track Name"]))
+        extras = []
+        for _, row in pool.iterrows():
+            if len(result) + len(extras) >= count:
+                break
+            artists = _row_artists(row)
+            if any(a in seen for a in artists) or (row["Artist Name(s)"], row["Track Name"]) in picked:
+                continue
+            seen.update(artists)
+            extras.append(row)
+        if extras:
+            _log(f"Unique-artists: replaced {len(extras)} repeat-artist picks from the pool.")
+            result = pd.concat([result, pd.DataFrame(extras)], ignore_index=True)
+    return result.reset_index(drop=True)
 
 
 def smooth_order(setlist: pd.DataFrame, arc: bool = False) -> pd.DataFrame:
@@ -248,6 +287,7 @@ def build_setlist(
     model: str = None,
     smooth: bool = False,
     arc: bool = False,
+    unique_artists: bool = False,
 ) -> tuple[pd.DataFrame, str]:
     """Full pipeline: constraints -> filter -> LLM selection -> optional smoothing.
 
@@ -267,7 +307,9 @@ def build_setlist(
     _log(f"Candidate pool: {len(pool)} tracks (library: {len(library)})")
 
     count = min(count, len(pool))
-    setlist, reasoning = choose_setlist(prompt, pool, count, model)
+    setlist, reasoning = choose_setlist(prompt, pool, count, model, unique_artists=unique_artists)
+    if unique_artists:
+        setlist = enforce_unique_artists(setlist, pool, count)
 
     if smooth or arc:
         setlist = smooth_order(setlist, arc=arc)
