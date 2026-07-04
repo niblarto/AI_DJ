@@ -20,6 +20,10 @@ tags = ["mutagen"]
 
 [project.scripts]
 ai-dj = "ai_dj.cli:main"
+ai-dj-web = "ai_dj.webapp:main"
 
 [tool.setuptools]
 packages = ["ai_dj"]
+
+[tool.setuptools.package-data]
+ai_dj = ["web/*.html"]

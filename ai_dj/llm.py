@@ -32,7 +32,13 @@ def chat_json(
                 ],
                 "format": "json",
                 "stream": False,
-                "options": {"temperature": temperature},
+                # num_ctx: the default 4096 truncates large candidate-pool prompts,
+                # which makes the model loop; num_predict caps runaway JSON output.
+                "options": {
+                    "temperature": temperature,
+                    "num_ctx": 16384,
+                    "num_predict": 4096,
+                },
             },
             timeout=timeout,
         )

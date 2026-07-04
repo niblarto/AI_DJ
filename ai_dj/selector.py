@@ -200,13 +200,37 @@ def choose_setlist(prompt: str, pool: pd.DataFrame, count: int, model: str) -> t
     return setlist, str(raw.get("reasoning", ""))
 
 
-def smooth_order(setlist: pd.DataFrame) -> pd.DataFrame:
+def smooth_order(setlist: pd.DataFrame, arc: bool = False) -> pd.DataFrame:
     """Reorder by greedy nearest-neighbour chain over bpm_matcher's weighted
-    distance, keeping the model's opening track."""
+    distance.
+
+    Plain mode keeps the model's opening track and chains to whichever
+    remaining track is closest, which gives smooth adjacent transitions but
+    no overall shape - energy/BPM can rise and fall repeatedly.
+
+    Arc mode instead starts from the lowest-energy track and, at each step,
+    only considers remaining tracks whose energy is >= the current one
+    (falling back to the globally closest track if none qualify, e.g. near
+    the end of the set), so the set rises toward peak energy instead of
+    bouncing around.
+    """
     if len(setlist) < 3:
         return setlist
     dist = cross_distance_matrix(setlist, setlist)
     np.fill_diagonal(dist, np.inf)
+
+    if arc:
+        # Sort by energy so the arc is strictly monotonic rising - a greedy
+        # distance-based chain (even a windowed one) will trade energy order
+        # for BPM/key smoothness and produce dips, which defeats the point of
+        # asking for a build. Ties (equal energy) are broken by BPM so same-
+        # energy stretches still progress sensibly.
+        order = list(
+            setlist[["Energy", "Tempo"]]
+            .assign(_idx=range(len(setlist)))
+            .sort_values(["Energy", "Tempo"])["_idx"]
+        )
+        return setlist.iloc[order].reset_index(drop=True)
 
     order = [0]
     remaining = set(range(1, len(setlist)))
@@ -223,8 +247,13 @@ def build_setlist(
     n: int | None = None,
     model: str = None,
     smooth: bool = False,
+    arc: bool = False,
 ) -> tuple[pd.DataFrame, str]:
-    """Full pipeline: constraints -> filter -> LLM selection -> optional smoothing."""
+    """Full pipeline: constraints -> filter -> LLM selection -> optional smoothing.
+
+    `arc=True` orders the smoothed set as a rising energy arc (mellow opener
+    to peak-energy closer) instead of plain nearest-neighbour chaining.
+    """
     from .llm import DEFAULT_MODEL
 
     model = model or DEFAULT_MODEL
@@ -240,6 +269,6 @@ def build_setlist(
     count = min(count, len(pool))
     setlist, reasoning = choose_setlist(prompt, pool, count, model)
 
-    if smooth:
-        setlist = smooth_order(setlist)
+    if smooth or arc:
+        setlist = smooth_order(setlist, arc=arc)
     return setlist, reasoning

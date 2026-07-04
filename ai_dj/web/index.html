@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI DJ</title>
+<style>
+  :root {
+    --bg: #0e0f13; --panel: #171922; --panel2: #1e2130; --line: #2a2e40;
+    --text: #e8eaf2; --dim: #8b90a5; --accent: #7c5cff; --accent2: #38d0c4;
+    --err: #ff6b7a; --ok: #4cd97b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: radial-gradient(1200px 600px at 70% -10%, #1c1440 0%, var(--bg) 60%);
+    color: var(--text); font: 15px/1.5 "Segoe UI", system-ui, sans-serif; min-height: 100vh;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 40px 20px 80px; }
+  h1 { font-size: 34px; margin: 0 0 4px; letter-spacing: .5px; }
+  h1 .dot { color: var(--accent2); }
+  .tag { color: var(--dim); margin: 0 0 28px; }
+  .status { float: right; font-size: 13px; color: var(--dim); margin-top: 14px; }
+  .status .led { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: var(--dim); }
+  .status.on .led { background: var(--ok); }
+  .status.off .led { background: var(--err); }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px 24px; margin-bottom: 18px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--accent2); margin: 0 0 14px; }
+  label { display: block; font-size: 13px; color: var(--dim); margin: 12px 0 5px; }
+  label:first-of-type { margin-top: 0; }
+  input[type=text], input[type=number], textarea, select {
+    width: 100%; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); padding: 10px 12px; font: inherit;
+  }
+  textarea { resize: vertical; min-height: 76px; }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 14px; }
+  .row > div { flex: 1; }
+
+  .seg { display: inline-flex; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { background: none; border: none; color: var(--dim); padding: 8px 18px; font: inherit; cursor: pointer; }
+  .seg button.active { background: var(--accent); color: #fff; }
+  .sizebox input { width: 110px; margin-left: 12px; }
+  .inline { display: flex; align-items: center; }
+
+  .go {
+    display: block; width: 100%; margin-top: 6px; padding: 14px; font: 600 17px/1 inherit;
+    background: linear-gradient(90deg, var(--accent), #a04cff); color: #fff;
+    border: none; border-radius: 10px; cursor: pointer;
+  }
+  .go:disabled { opacity: .5; cursor: wait; }
+  .error { color: var(--err); margin-top: 14px; white-space: pre-wrap; display: none; }
+
+  #results { display: none; }
+  .notes { color: var(--dim); font-style: italic; margin: 0 0 14px; }
+  .summary { margin: 0 0 14px; }
+  .summary .ok { color: var(--ok); }
+  .summary .miss { color: var(--err); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; color: var(--dim); font-weight: 500; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.missing td { color: var(--dim); }
+  .pill { display: inline-block; background: var(--panel2); border-radius: 20px; padding: 1px 9px; font-size: 12px; }
+  .spin { display: none; text-align: center; color: var(--dim); padding: 18px; }
+  .spin.on { display: block; }
+  .details summary { cursor: pointer; color: var(--dim); font-size: 13px; margin-top: 12px; }
+
+  .tgl-group { margin-top: 12px; }
+  .tgl-group:first-of-type { margin-top: 4px; }
+  .tgl-group .gname { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 20px;
+    color: var(--dim); padding: 5px 13px; font: 13px/1.3 inherit; cursor: pointer;
+  }
+  .chip:hover { border-color: var(--accent); color: var(--text); }
+  .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #tglSummary { color: var(--dim); font-size: 13px; }
+  #tglSummary b { color: var(--accent2); }
+
+  .pathrow { display: flex; gap: 8px; }
+  .pathrow input { flex: 1; }
+  .browse {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); padding: 0 14px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  .browse:hover { border-color: var(--accent); }
+
+  #picker { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; z-index: 10; }
+  #picker.on { display: flex; align-items: center; justify-content: center; }
+  .picker-box {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    width: min(560px, 92vw); max-height: 80vh; display: flex; flex-direction: column; padding: 18px 20px;
+  }
+  .picker-box h3 { margin: 0 0 10px; font-size: 15px; }
+  .picker-path { font-size: 13px; color: var(--accent2); word-break: break-all; margin-bottom: 10px; }
+  .picker-list { overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; flex: 1; min-height: 220px; }
+  .picker-list div { padding: 7px 12px; cursor: pointer; border-bottom: 1px solid var(--line); }
+  .picker-list div:hover { background: var(--panel2); }
+  .picker-list .file { color: var(--accent2); }
+  .picker-list .empty { color: var(--dim); cursor: default; }
+  .picker-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+  .picker-actions button {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); padding: 9px 16px; font: inherit; cursor: pointer;
+  }
+  .picker-actions .primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="llmStatus" class="status"><span class="led"></span>checking Ollama…</div>
+  <h1>AI DJ<span class="dot">.</span></h1>
+  <p class="tag">Tell it what you want to hear — get an ordered, key-and-BPM-aware mix as an M3U.</p>
+
+  <form id="form">
+    <div class="card">
+      <h2>Your request</h2>
+      <textarea id="prompt" placeholder="e.g. progressive house building up energy, nothing too vocal — set the length under Mix size"></textarea>
+
+      <label>Mix size</label>
+      <div class="inline sizebox">
+        <div class="seg">
+          <button type="button" id="modeTracks" class="active">Tracks</button>
+          <button type="button" id="modeMinutes">Minutes</button>
+        </div>
+        <input type="number" id="sizeValue" min="1" placeholder="15">
+        <span style="color:var(--dim); margin-left:10px; font-size:13px">overrides any length in the prompt; blank = prompt's track count, else 15</span>
+      </div>
+
+      <label>Track ordering</label>
+      <div class="seg">
+        <button type="button" data-order="none" class="active">DJ's order</button>
+        <button type="button" data-order="smooth">Smoothest transitions</button>
+        <button type="button" data-order="arc">Rising energy arc</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Style toggles</h2>
+      <details class="details" id="tglDetails">
+        <summary id="tglSummary">Optional — shape tempo, key, energy, vibe and structure</summary>
+        <div id="toggles"></div>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>Track sources</h2>
+      <label>Library CSV (Exportify export)</label>
+      <div class="pathrow">
+        <input type="text" id="csv" placeholder="E:/Code/AI_BPM/data/Running.csv">
+        <button type="button" class="browse" data-target="csv" data-ext=".csv">Browse…</button>
+      </div>
+      <details class="details">
+        <summary>Local file resolution (Mixxx DB / music folder)</summary>
+        <label>Mixxx database</label>
+        <div class="pathrow">
+          <input type="text" id="mixxxdb" placeholder="%LOCALAPPDATA%/Mixxx/mixxxdb.sqlite">
+          <button type="button" class="browse" data-target="mixxxdb" data-ext=".sqlite">Browse…</button>
+        </div>
+        <label>Music folder to scan (optional)</label>
+        <div class="pathrow">
+          <input type="text" id="musicDir" placeholder="E:/Music">
+          <button type="button" class="browse" data-target="musicDir">Browse…</button>
+        </div>
+        <label>Ollama model</label>
+        <input type="text" id="model" placeholder="qwen2.5:7b">
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>Output</h2>
+      <div class="row">
+        <div>
+          <label>Folder</label>
+          <div class="pathrow">
+            <input type="text" id="outDir" placeholder="C:/Users/you/Music/AI_DJ">
+            <button type="button" class="browse" data-target="outDir">Browse…</button>
+          </div>
+        </div>
+        <div>
+          <label>Filename (blank = preview only, no file)</label>
+          <input type="text" id="filename" placeholder="friday-warmup.m3u8">
+        </div>
+      </div>
+    </div>
+
+    <button class="go" id="go" type="submit">Generate mix</button>
+    <div class="error" id="error"></div>
+  </form>
+
+  <div class="spin" id="spin">The DJ is digging through the crates… (two local LLM calls, can take a minute)</div>
+
+  <div class="card" id="results">
+    <h2>Setlist</h2>
+    <p class="summary" id="summary"></p>
+    <p class="notes" id="notes"></p>
+    <div style="overflow-x:auto"><table>
+      <thead><tr><th>#</th><th>Track</th><th>Artist</th><th class="num">BPM</th><th>Key</th><th class="num">Energy</th><th class="num">Length</th><th>File</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  </div>
+</div>
+
+<div id="picker">
+  <div class="picker-box">
+    <h3 id="pickerTitle">Choose a folder</h3>
+    <div class="picker-path" id="pickerPath"></div>
+    <div class="picker-list" id="pickerList"></div>
+    <div class="picker-actions">
+      <button type="button" id="pickerCancel">Cancel</button>
+      <button type="button" class="primary" id="pickerSelect">Select this folder</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let sizeMode = "tracks", order = "none";
+
+$("modeTracks").onclick = () => setSizeMode("tracks");
+$("modeMinutes").onclick = () => setSizeMode("minutes");
+function setSizeMode(m) {
+  sizeMode = m;
+  $("modeTracks").classList.toggle("active", m === "tracks");
+  $("modeMinutes").classList.toggle("active", m === "minutes");
+  $("sizeValue").placeholder = m === "tracks" ? "15" : "45";
+}
+document.querySelectorAll("[data-order]").forEach(b => b.onclick = () => {
+  order = b.dataset.order;
+  document.querySelectorAll("[data-order]").forEach(x => x.classList.toggle("active", x === b));
+});
+
+// ---- style toggles ---------------------------------------------------
+// Each toggle appends a directive phrase to the prompt. `x` marks an
+// exclusivity set: turning one on turns off the others in the same set.
+const TOGGLES = [
+  ["BPM / Tempo", [
+    ["Steady-BPM", "keep the tempo steady, all tracks within a narrow BPM range"],
+    ["Ramp-Up", "gradually increase the tempo from start to finish"],
+    ["Ramp-Down", "gradually decrease the tempo from start to finish"],
+    ["Pulse", "alternate between faster and slower tracks in a pulsing rhythm"],
+    ["Slow-Flow", "slow tempo, under 100 BPM", "tempo"],
+    ["Mid-Tempo", "mid-tempo, roughly 100-120 BPM", "tempo"],
+    ["High-Tempo", "fast tempo, roughly 125-145 BPM", "tempo"],
+    ["Sprint", "very fast tempo, 150 BPM or more", "tempo"],
+    ["Groove", "prioritize groove: strongly danceable, rhythm-forward tracks"],
+  ]],
+  ["Key / Harmony", [
+    ["Harmonic", "every transition must be harmonically compatible (same or adjacent Camelot keys)"],
+    ["Key-Locked", "keep all tracks in the same key", "keys"],
+    ["Key-Shift", "shift keys progressively upward through the set for a sense of lift", "keys"],
+    ["Minor-Mode", "minor keys only (Camelot A keys)", "mode"],
+    ["Major-Mode", "major keys only (Camelot B keys)", "mode"],
+  ]],
+  ["Energy / Dynamics", [
+    ["Low-Energy", "low energy throughout (energy below 0.4)", "energy"],
+    ["Medium-Energy", "medium energy throughout (energy 0.4-0.7)", "energy"],
+    ["High-Energy", "high energy throughout (energy above 0.7)", "energy"],
+    ["Energy-Wave", "let the energy rise and fall in waves across the set"],
+    ["Peak-Mode", "sustained peak-time intensity from the first track"],
+    ["Chill", "relaxed, laid-back feel"],
+    ["Drive", "constant forward drive and momentum"],
+  ]],
+  ["Vibe / Mood", [
+    ["Uplift", "uplifting, positive mood (high valence)"],
+    ["Dark-Club", "dark, late-night club atmosphere (low valence, hypnotic)"],
+    ["Bright", "bright and shiny sound"],
+    ["Moody", "moody and introspective"],
+    ["Dreamy", "dreamy, floating atmosphere"],
+    ["Hypnotic", "hypnotic and repetitive, trance-inducing"],
+    ["Aggressive", "aggressive, hard-hitting"],
+    ["Playful", "playful and fun"],
+    ["Euphoric", "euphoric, hands-in-the-air moments"],
+  ]],
+  ["Selection", [
+    ["Hidden-Gems", "prefer lesser-known tracks and deep cuts over the obvious picks"],
+    ["Classics", "prefer well-known, recognizable tracks"],
+    ["Fresh-Finds", "prefer newer releases over older material"],
+    ["Danceability", "only strongly danceable tracks (danceability above 0.7)"],
+  ]],
+  ["Structure", [
+    ["Story-Arc", "shape the set as a story with a clear beginning, middle and end"],
+    ["Build-Up", "build steadily toward a climax at the end"],
+    ["Breakdown", "include a mid-set breakdown: a dip into something sparse before rebuilding"],
+    ["Resolve", "end on a resolving, satisfying closer rather than at full intensity"],
+    ["Contrast-Mode", "use bold contrasts between adjacent tracks"],
+    ["Alternating-Energy", "alternate between high-energy and low-energy tracks"],
+  ]],
+  ["Texture / Style", [
+    ["Minimal", "minimal, stripped-back production"],
+    ["Dense", "dense, layered production"],
+    ["Percussive", "percussion-forward tracks"],
+    ["Melodic", "strong melodies and hooks"],
+    ["Atmospheric", "atmospheric, ambient textures"],
+    ["Vintage", "vintage, classic-era sound"],
+    ["Modern", "modern, contemporary production"],
+    ["Organic", "organic, warm instrumentation"],
+    ["Synthetic", "synthetic, electronic textures"],
+  ]],
+];
+
+const active = new Map();  // label -> phrase
+const tglRoot = $("toggles");
+TOGGLES.forEach(([gname, items]) => {
+  const g = document.createElement("div");
+  g.className = "tgl-group";
+  g.innerHTML = `<div class="gname">${gname}</div>`;
+  const chips = document.createElement("div");
+  chips.className = "chips";
+  items.forEach(([label, phrase, excl]) => {
+    const c = document.createElement("button");
+    c.type = "button"; c.className = "chip"; c.textContent = label;
+    c.onclick = () => {
+      const on = c.classList.toggle("on");
+      if (on && excl) {
+        chips.querySelectorAll(".chip.on").forEach(o => {
+          if (o !== c && o.dataset.excl === excl) { o.classList.remove("on"); active.delete(o.textContent); }
+        });
+      }
+      on ? active.set(label, phrase) : active.delete(label);
+      const n = active.size;
+      $("tglSummary").innerHTML = n
+        ? `<b>${n} active:</b> ${[...active.keys()].join(", ")}`
+        : "Optional — shape tempo, key, energy, vibe and structure";
+    };
+    if (excl) c.dataset.excl = excl;
+    chips.appendChild(c);
+  });
+  g.appendChild(chips);
+  tglRoot.appendChild(g);
+});
+
+function styledPrompt() {
+  const base = $("prompt").value.trim();
+  if (!active.size) return base;
+  return base + "\nStyle directives: " + [...active.values()].join("; ") + ".";
+}
+
+fetch("/api/defaults").then(r => r.json()).then(d => {
+  if (d.csv) $("csv").value = d.csv;
+  if (d.mixxxdb) $("mixxxdb").value = d.mixxxdb;
+  if (d.outDir) $("outDir").value = d.outDir;
+  if (d.model) $("model").placeholder = d.model;
+  const s = $("llmStatus");
+  s.classList.add(d.llm ? "on" : "off");
+  s.innerHTML = '<span class="led"></span>' + (d.llm ? "Ollama connected" : "Ollama unreachable");
+}).catch(() => {});
+
+$("form").onsubmit = async e => {
+  e.preventDefault();
+  $("error").style.display = "none";
+  $("results").style.display = "none";
+  const size = parseFloat($("sizeValue").value);
+  const body = {
+    prompt: styledPrompt(),
+    csv: $("csv").value,
+    mixxxdb: $("mixxxdb").value,
+    musicDir: $("musicDir").value,
+    model: $("model").value,
+    order,
+    outDir: $("outDir").value,
+    filename: $("filename").value,
+  };
+  if (!isNaN(size) && size > 0) body[sizeMode === "tracks" ? "tracks" : "minutes"] = size;
+
+  $("go").disabled = true; $("spin").classList.add("on");
+  try {
+    const resp = await fetch("/api/generate", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || resp.statusText);
+    render(data);
+  } catch (err) {
+    $("error").textContent = err.message;
+    $("error").style.display = "block";
+  } finally {
+    $("go").disabled = false; $("spin").classList.remove("on");
+  }
+};
+
+function fmtLen(ms) {
+  if (!ms) return "";
+  const s = Math.round(ms / 1000);
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+function render(data) {
+  const rows = $("rows");
+  rows.innerHTML = "";
+  data.tracks.forEach((t, i) => {
+    const tr = document.createElement("tr");
+    if (!t.location) tr.className = "missing";
+    tr.innerHTML =
+      `<td class="num">${i + 1}</td><td>${esc(t.name)}</td><td>${esc(t.artist)}</td>` +
+      `<td class="num">${Math.round(t.bpm)}</td><td><span class="pill">${esc(t.camelot)}</span></td>` +
+      `<td class="num">${t.energy.toFixed(2)}</td><td class="num">${fmtLen(t.durationMs)}</td>` +
+      `<td>${t.location ? "&#10003;" : "missing"}</td>`;
+    rows.appendChild(tr);
+  });
+  let summary = `${data.tracks.length} tracks, ${Math.round(data.totalMin)} min.`;
+  if (data.wrote) {
+    summary += ` Wrote <b>${esc(data.wrote.path)}</b> — <span class="ok">${data.wrote.resolved} playable</span>`;
+    if (data.wrote.missing) summary += `, <span class="miss">${data.wrote.missing} missing locally</span>`;
+    summary += ".";
+  } else {
+    summary += " Preview only — set a filename to write the M3U.";
+  }
+  $("summary").innerHTML = summary;
+  $("notes").textContent = data.reasoning ? "DJ notes: " + data.reasoning : "";
+  $("results").style.display = "block";
+  $("results").scrollIntoView({behavior: "smooth"});
+}
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// ---- path picker -----------------------------------------------------
+let pickTarget = null, pickExt = "", pickDir = "";
+
+document.querySelectorAll(".browse").forEach(b => b.onclick = () => {
+  pickTarget = $(b.dataset.target);
+  pickExt = b.dataset.ext || "";
+  $("pickerTitle").textContent = pickExt ? `Choose a ${pickExt} file` : "Choose a folder";
+  $("pickerSelect").style.display = pickExt ? "none" : "";
+  // Start from the field's current folder if it has one.
+  const cur = pickTarget.value.trim();
+  const start = cur ? cur.replace(/[\\/][^\\/]*\.[^\\/]*$/, "") : "";
+  $("picker").classList.add("on");
+  loadDir(start);
+});
+
+async function loadDir(path) {
+  const url = "/api/browse?path=" + encodeURIComponent(path) + (pickExt ? "&ext=" + pickExt : "");
+  let data;
+  try {
+    const resp = await fetch(url);
+    data = await resp.json();
+    if (!resp.ok) throw new Error(data.error);
+  } catch (err) {
+    if (path) return loadDir("");  // bad start path - fall back to drive list
+    $("pickerList").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    return;
+  }
+  pickDir = data.path;
+  $("pickerPath").textContent = data.path || "Drives";
+  const list = $("pickerList");
+  list.innerHTML = "";
+  const add = (label, cls, onclick) => {
+    const div = document.createElement("div");
+    div.className = cls; div.textContent = label; div.onclick = onclick;
+    list.appendChild(div);
+  };
+  if (data.path) add("⬆ ..", "", () => loadDir(data.parent));
+  data.dirs.forEach(d => add("📁 " + d, "", () => loadDir(data.path ? joinPath(data.path, d) : d)));
+  data.files.forEach(f => add("🎵 " + f, "file", () => finish(joinPath(data.path, f))));
+  if (!data.dirs.length && !data.files.length) add("(empty)", "empty", null);
+}
+
+const joinPath = (dir, name) => dir.replace(/[\\/]+$/, "") + "\\" + name;
+
+function finish(value) {
+  pickTarget.value = value;
+  $("picker").classList.remove("on");
+}
+$("pickerSelect").onclick = () => { if (pickDir) finish(pickDir); };
+$("pickerCancel").onclick = () => $("picker").classList.remove("on");
+$("picker").onclick = e => { if (e.target === $("picker")) $("pickerCancel").onclick(); };
+</script>
+</body>
+</html>
