@@ -110,12 +110,16 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
     if not isinstance(feedback, list):
         feedback = None
 
+    played = body.get("playedTracks")
+    if not isinstance(played, list):
+        played = None
+
     use_llm = app.config["USE_LLM"] and body.get("useLlm", True)
     try:
         playlist = build_workout_playlist(
             segments, library, model=app.config["MODEL"], use_llm=use_llm,
             cadence_buckets=buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
-            progress=progress,
+            played_tracks=played, progress=progress,
         )
     except ValueError as e:
         return {"error": str(e)}, 422

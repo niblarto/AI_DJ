@@ -186,7 +186,7 @@ def _bpm_distance(tempo: float, bpm: float) -> float:
 
 def _segment_pool(
     library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float,
-    easy_bias_sec: float = 0.0, used_artists: set | None = None,
+    easy_bias_sec: float = 0.0, used_artists: set | None = None, played: set | None = None,
 ) -> pd.DataFrame:
     e_lo, e_hi = ENERGY_BOUNDS[seg.kind]
     # Runner has been going faster than target on easy runs — calm the music
@@ -221,10 +221,16 @@ def _segment_pool(
         # One track per artist, applied BEFORE the budget check below so the
         # relaxation loop keeps widening until enough unique-artist music
         # exists to fill the whole segment. Keep each artist's closest-to-BPM
-        # track so the dedupe costs as little tempo accuracy as possible.
+        # track so the dedupe costs as little tempo accuracy as possible —
+        # with already-played-at-this-pace tracks sorting behind unplayed
+        # ones, so an artist's fresh track wins over their played one.
         if seg.bpm:
             dist = pool["Tempo"].map(lambda t: _bpm_distance(float(t), seg.bpm))
-            pool = pool.loc[dist.sort_values(kind="stable").index]
+        else:
+            dist = pd.Series(0.0, index=pool.index)
+        if played:
+            dist = dist + pool["Track URI"].isin(played) * 1000.0
+        pool = pool.loc[dist.sort_values(kind="stable").index]
         pool = pool.loc[~pool["Artist Name(s)"].map(_primary_artist).duplicated()]
         # The pool must be able to fill the whole segment — a 2h long run
         # needs far more than min_pool tracks.
@@ -276,6 +282,7 @@ def build_workout_playlist(
     cadence_buckets: dict[int, float] | None = None,
     easy_bias_sec: float = 0.0,
     track_feedback: list[dict] | None = None,
+    played_tracks: list[dict] | None = None,
     progress=None,
 ) -> pd.DataFrame:
     """Fill every segment with BPM-matched tracks; returns rows with a
@@ -321,6 +328,17 @@ def build_workout_playlist(
             and abs(float(f.get("paceSec") or 0) - pace_sec) <= FEEDBACK_PACE_TOLERANCE
         }
 
+    # Tracks already played in a past run at (roughly) this pace: unvoted ones
+    # rank below unplayed tracks, so mixes stay fresh unless the pool runs dry.
+    def _played_uris(pace_sec):
+        if not played_tracks or not pace_sec:
+            return set()
+        return {
+            p.get("uri") for p in played_tracks
+            if p.get("uri") and p.get("paceSec") is not None
+            and abs(float(p["paceSec"]) - pace_sec) <= FEEDBACK_PACE_TOLERANCE
+        }
+
     for seg_idx, seg in enumerate(segments):
         if progress:
             try:
@@ -336,8 +354,9 @@ def build_workout_playlist(
             continue
 
         downvoted = _feedback_uris(seg.pace_sec, "down")
+        played = _played_uris(seg.pace_sec)
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
-        pool = _segment_pool(lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec, used_artists=used_artists)
+        pool = _segment_pool(lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec, used_artists=used_artists, played=played)
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue
@@ -377,8 +396,16 @@ def build_workout_playlist(
                 extra = leftover.iloc[_chain_order(leftover, ordered.tail(1))]
                 ordered = pd.concat([ordered, extra], ignore_index=True)
 
-        # Upvoted-at-this-pace tracks lead the segment so they make the cut.
+        # Played-but-unvoted tracks drop to the back of the ordering, so they
+        # only make the cut when the unplayed pool can't fill the budget.
         boosted = _feedback_uris(seg.pace_sec, "up")
+        demoted = played - boosted
+        if demoted:
+            is_played = ordered["Track URI"].isin(demoted)
+            if is_played.any():
+                ordered = pd.concat([ordered[~is_played], ordered[is_played]])
+
+        # Upvoted-at-this-pace tracks lead the segment so they make the cut.
         if boosted:
             is_boost = ordered["Track URI"].isin(boosted)
             if is_boost.any():
