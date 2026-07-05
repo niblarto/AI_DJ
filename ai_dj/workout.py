@@ -179,6 +179,11 @@ def _primary_artist(name) -> str:
     return re.split(r",|;|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|&", str(name), 1, flags=re.IGNORECASE)[0].strip().lower()
 
 
+def _bpm_distance(tempo: float, bpm: float) -> float:
+    """Distance to target allowing half/double-time matches, mirroring bpm_filter."""
+    return min(abs(tempo - bpm), abs(tempo * 2 - bpm), abs(tempo / 2 - bpm))
+
+
 def _segment_pool(
     library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float,
     easy_bias_sec: float = 0.0, used_artists: set | None = None,
@@ -200,6 +205,10 @@ def _segment_pool(
     else:
         # Effort kinds keep BPM tight and pad the energy window open instead.
         attempts = [(tol, pad) for tol in BPM_TOLERANCES for pad in (0.0, 0.1, 0.2, 1.0)]
+        # Last resorts: with one track per artist, a long segment can exhaust
+        # the unique artists near the target BPM — better off-tempo music at
+        # the back of the pool than silence mid-run.
+        attempts += [(12.0, 1.0), (None, 1.0)]
     for tol, pad in attempts:
         pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
         pool = pool[
@@ -209,6 +218,14 @@ def _segment_pool(
         pool = pool[~pool["Track URI"].isin(used)] if "Track URI" in pool.columns else pool
         if used_artists:
             pool = pool[~pool["Artist Name(s)"].map(_primary_artist).isin(used_artists)]
+        # One track per artist, applied BEFORE the budget check below so the
+        # relaxation loop keeps widening until enough unique-artist music
+        # exists to fill the whole segment. Keep each artist's closest-to-BPM
+        # track so the dedupe costs as little tempo accuracy as possible.
+        if seg.bpm:
+            dist = pool["Tempo"].map(lambda t: _bpm_distance(float(t), seg.bpm))
+            pool = pool.loc[dist.sort_values(kind="stable").index]
+        pool = pool.loc[~pool["Artist Name(s)"].map(_primary_artist).duplicated()]
         # The pool must be able to fill the whole segment — a 2h long run
         # needs far more than min_pool tracks.
         if len(pool) >= min_pool and pool["Duration (ms)"].sum() / 1000 >= budget_sec:
