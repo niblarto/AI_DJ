@@ -189,7 +189,14 @@ def mix_stream():
         # Padding comment flushes past client-side SSE buffers
         yield ": " + "x" * 1024 + "\n\n"
         while True:
-            msg = q.get()
+            try:
+                msg = q.get(timeout=15)
+            except queue.Empty:
+                # Heartbeat: a segment's LLM pick can run minutes with no
+                # progress event — keep bytes flowing so proxies between the
+                # Pi and this service never idle the connection out.
+                yield ": hb\n\n"
+                continue
             yield f"data: {json.dumps(msg)}\n\n"
             if msg["type"] in ("done", "error"):
                 return

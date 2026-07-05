@@ -38,13 +38,16 @@ prompt ──▶ LLM (Ollama): extract constraints (BPM range, energy, count)
    ollama pull mistral-nemo:12b
    ```
    Default model is `mistral-nemo:12b` (better constraint extraction and
-   energy-arc quality than `qwen2.5:7b` in side-by-side testing, at ~2x the
-   latency from partial GPU/CPU split on a 10GB card - `qwen2.5:7b` is
-   noticeably faster if that trade isn't worth it: `ollama pull qwen2.5:7b`
+   energy-arc quality than `qwen2.5:7b` in side-by-side testing; `qwen2.5:7b`
+   is noticeably faster if that trade isn't worth it: `ollama pull qwen2.5:7b`
    then set `AI_DJ_MODEL=qwen2.5:7b` or pass `--model qwen2.5:7b`). On a
-   10GB GPU, `mistral-nemo:12b` needs `num_ctx` capped around 8192 to stay
-   fully on-GPU; the pipeline's default 16384 spills ~15% to CPU, which is
-   the accepted tradeoff for the larger candidate pool below.
+   10GB GPU, `mistral-nemo:12b` needs `num_ctx` capped at 9728 to stay fully
+   on-GPU (measured: 9728 holds at 100% GPU, 10240 already spills ~7% to
+   CPU) - the pipeline sets this by default. `qwen2.5:14b` and `phi4:14b` were
+   also tried as middle-ground options but neither fits on a 10GB card even
+   at num_ctx=8192 (23-35% spills to CPU), so they're not worth pulling here;
+   `gemma2:9b` fits fully on-GPU but its native context tops out at 8192,
+   below what the candidate-pool prompt needs.
 2. **Python deps** — `pip install -r requirements.txt` (or reuse the AI_BPM
    venv, which already has everything except mutagen).
 3. **bpm_matcher** — expected at `E:\Code\AI_BPM`; override with the

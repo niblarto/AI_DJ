@@ -34,9 +34,11 @@ def chat_json(
                 "stream": False,
                 # num_ctx: the default 4096 truncates large candidate-pool prompts,
                 # which makes the model loop; num_predict caps runaway JSON output.
+                # 9728 is the measured ceiling for mistral-nemo:12b to stay 100% on a
+                # 10GB GPU (10240 already spills ~7% to CPU) - see README Setup notes.
                 "options": {
                     "temperature": temperature,
-                    "num_ctx": 16384,
+                    "num_ctx": 9728,
                     "num_predict": 4096,
                 },
             },
