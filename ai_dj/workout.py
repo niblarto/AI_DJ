@@ -173,9 +173,15 @@ def pace_to_bpm(pace_sec: float, cadence_buckets: dict[int, float] | None = None
 
 # ── Selection ────────────────────────────────────────────────────────────────
 
+# One track per artist across the whole mix: compare on the first credited
+# artist so "Foo", "Foo, Bar" and "Foo feat. Baz" all count as the same artist.
+def _primary_artist(name) -> str:
+    return re.split(r",|;|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|&", str(name), 1, flags=re.IGNORECASE)[0].strip().lower()
+
+
 def _segment_pool(
     library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float,
-    easy_bias_sec: float = 0.0,
+    easy_bias_sec: float = 0.0, used_artists: set | None = None,
 ) -> pd.DataFrame:
     e_lo, e_hi = ENERGY_BOUNDS[seg.kind]
     # Runner has been going faster than target on easy runs — calm the music
@@ -201,6 +207,8 @@ def _segment_pool(
             & (pool["Energy"] <= min(e_hi + pad, 1))
         ]
         pool = pool[~pool["Track URI"].isin(used)] if "Track URI" in pool.columns else pool
+        if used_artists:
+            pool = pool[~pool["Artist Name(s)"].map(_primary_artist).isin(used_artists)]
         # The pool must be able to fill the whole segment — a 2h long run
         # needs far more than min_pool tracks.
         if len(pool) >= min_pool and pool["Duration (ms)"].sum() / 1000 >= budget_sec:
@@ -283,6 +291,7 @@ def build_workout_playlist(
 
     parts: list[pd.DataFrame] = []
     used: set = set()
+    used_artists: set = set()
     prev_tail: pd.DataFrame | None = None
     carry = 0.0
 
@@ -311,7 +320,7 @@ def build_workout_playlist(
 
         downvoted = _feedback_uris(seg.pace_sec, "down")
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
-        pool = _segment_pool(lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec)
+        pool = _segment_pool(lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec, used_artists=used_artists)
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue
@@ -358,6 +367,11 @@ def build_workout_playlist(
             if is_boost.any():
                 ordered = pd.concat([ordered[is_boost], ordered[~is_boost]])
 
+        # One track per artist: the pool already excludes artists picked in
+        # earlier segments, but the ordering itself can still carry several
+        # tracks by one artist — keep only the first of each.
+        ordered = ordered[~ordered["Artist Name(s)"].map(_primary_artist).duplicated()]
+
         chosen = _fit_duration(ordered, budget, overshoot=is_last).copy()
         chosen["Segment"] = seg.label
         chosen["Target BPM"] = seg.bpm
@@ -366,6 +380,7 @@ def build_workout_playlist(
         actual = chosen["Duration (ms)"].sum() / 1000
         carry = actual - budget
         used.update(chosen.get("Track URI", pd.Series(dtype=str)))
+        used_artists.update(chosen["Artist Name(s)"].map(_primary_artist))
         prev_tail = chosen.tail(1)
         parts.append(chosen)
         _log(
