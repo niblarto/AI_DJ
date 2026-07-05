@@ -251,6 +251,7 @@ def build_workout_playlist(
     cadence_buckets: dict[int, float] | None = None,
     easy_bias_sec: float = 0.0,
     track_feedback: list[dict] | None = None,
+    progress=None,
 ) -> pd.DataFrame:
     """Fill every segment with BPM-matched tracks; returns rows with a
     Segment label and cumulative timing columns.
@@ -264,6 +265,10 @@ def build_workout_playlist(
     target (sec/mi): easy-type segments are then built as if their pace were
     that much slower (lower SPM) with a lower energy ceiling. Easy pace is a
     ceiling ("no faster than"), so the bias only ever slows the music down.
+
+    progress: optional callable(done, total, segment_label) invoked as each
+    segment starts building — lets callers stream a live progress bar (the
+    per-segment LLM call is the slow part).
     """
     easy_bias_sec = min(max(easy_bias_sec, 0.0), 30.0)
     for seg in segments:
@@ -290,7 +295,12 @@ def build_workout_playlist(
             and abs(float(f.get("paceSec") or 0) - pace_sec) <= FEEDBACK_PACE_TOLERANCE
         }
 
-    for seg in segments:
+    for seg_idx, seg in enumerate(segments):
+        if progress:
+            try:
+                progress(seg_idx, len(segments), seg.label)
+            except Exception:
+                pass
         is_last = seg is segments[-1]
         budget = seg.duration_sec - carry
         # Previous overshoot already covers this segment (but the final

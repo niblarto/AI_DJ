@@ -30,10 +30,13 @@ GET /health -> {"ok": true, "llm": true|false}
 
 import argparse
 import io
+import json
+import queue
 import sys
+import threading
 
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 from bpm_matcher.camelot import to_camelot
 
@@ -74,22 +77,21 @@ def health():
     return jsonify({"ok": True, "llm": llm_ok})
 
 
-@app.post("/mix")
-def mix():
-    body = request.get_json(force=True)
+def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
+    """Shared /mix and /mix/stream builder — returns (payload, http_status)."""
     segments_text = body.get("segments") or []
     csv_text = body.get("csv") or ""
     if not segments_text or not csv_text:
-        return jsonify({"error": "segments and csv are required"}), 400
+        return {"error": "segments and csv are required"}, 400
 
     try:
         library = _load_library(csv_text)
     except Exception as e:
-        return jsonify({"error": f"Could not parse library CSV: {e}"}), 400
+        return {"error": f"Could not parse library CSV: {e}"}, 400
 
     segments = parse_workout(segments_text, easy_pace_sec=_parse_pace(body.get("easyPace")))
     if not segments:
-        return jsonify({"error": "No runnable segments recognized in the workout"}), 400
+        return {"error": "No runnable segments recognized in the workout"}, 400
 
     buckets = None
     raw_buckets = body.get("cadenceBuckets")
@@ -113,9 +115,10 @@ def mix():
         playlist = build_workout_playlist(
             segments, library, model=app.config["MODEL"], use_llm=use_llm,
             cadence_buckets=buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
+            progress=progress,
         )
     except ValueError as e:
-        return jsonify({"error": str(e)}), 422
+        return {"error": str(e)}, 422
 
     timeline = []
     for seg_label, group in playlist.groupby("Segment", sort=False):
@@ -141,12 +144,60 @@ def mix():
             }
         )
 
-    return jsonify(
-        {
-            "trackUris": [u for u in playlist["Track URI"] if isinstance(u, str)],
-            "totalSec": float(playlist["Duration (ms)"].sum() / 1000),
-            "timeline": timeline,
-        }
+    return {
+        "trackUris": [u for u in playlist["Track URI"] if isinstance(u, str)],
+        "totalSec": float(playlist["Duration (ms)"].sum() / 1000),
+        "timeline": timeline,
+    }, 200
+
+
+@app.post("/mix")
+def mix():
+    payload, status = _build_mix_payload(request.get_json(force=True))
+    return jsonify(payload), status
+
+
+@app.post("/mix/stream")
+def mix_stream():
+    """SSE variant of /mix: streams per-segment progress while the mix builds.
+
+    Events: {"type": "progress", "current", "total", "segment"} as each
+    segment starts, then {"type": "done", ...mix} or {"type": "error", "error"}.
+    The build runs in a worker thread; the generator drains its queue.
+    """
+    body = request.get_json(force=True)
+    q: "queue.Queue[dict]" = queue.Queue()
+
+    def worker():
+        try:
+            payload, status = _build_mix_payload(
+                body,
+                progress=lambda done, total, label: q.put(
+                    {"type": "progress", "current": done, "total": total, "segment": label}
+                ),
+            )
+            if status == 200:
+                q.put({"type": "done", **payload})
+            else:
+                q.put({"type": "error", "error": payload.get("error", f"mix failed ({status})")})
+        except Exception as e:  # never leave the stream hanging
+            q.put({"type": "error", "error": str(e)})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def gen():
+        # Padding comment flushes past client-side SSE buffers
+        yield ": " + "x" * 1024 + "\n\n"
+        while True:
+            msg = q.get()
+            yield f"data: {json.dumps(msg)}\n\n"
+            if msg["type"] in ("done", "error"):
+                return
+
+    return Response(
+        gen(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
 
 
