@@ -132,10 +132,11 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
     timeline = []
     for seg_label, group in playlist.groupby("Segment", sort=False):
         target_pace = group["Target Pace"].iloc[0] if "Target Pace" in group.columns else None
+        target_bpm = group["Target BPM"].iloc[0]
         timeline.append(
             {
                 "segment": seg_label,
-                "targetBpm": float(group["Target BPM"].iloc[0]),
+                "targetBpm": float(target_bpm) if pd.notna(target_bpm) else None,
                 "targetPaceSec": float(target_pace) if pd.notna(target_pace) else None,
                 "tracks": [
                     {

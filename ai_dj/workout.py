@@ -59,6 +59,9 @@ ENERGY_BOUNDS = {
     "easy": (0.00, 0.55),
     "cooldown": (0.00, 0.60),
     "rest": (0.00, 0.50),
+    # Strength sessions: no cadence to match (pace_sec is None so BPM is
+    # unfiltered) — just up-tempo, high-energy motivation.
+    "strength": (0.70, 1.00),
 }
 
 # Easy-effort kinds: get the calmer end of the energy envelope and the
@@ -111,6 +114,8 @@ _REST_RE = re.compile(r"(\d+)\s*(s|sec|secs|min|mins?)\b[^,]*\b(?:rest|walk)", r
 
 def _segment_kind(text: str) -> str:
     t = text.lower()
+    if "strength" in t:
+        return "strength"
     if "warm up" in t or "warmup" in t:
         return "warmup"
     if "cool down" in t or "cooldown" in t:
@@ -133,6 +138,7 @@ def _is_segment_line(line: str) -> bool:
         or "warm up" in t or "warmup" in t
         or "cool down" in t or "cooldown" in t
         or "conversational" in t
+        or "strength" in t
     )
 
 
@@ -162,7 +168,9 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
             # treat it as easy effort, not a hard "work" interval.
             if kind == "work" and not pace_m:
                 kind = "easy"
-            segments.append(Segment(run_part, kind, duration, pace))
+            # Strength has no pace: pace_sec None leaves seg.bpm unset, so
+            # tracks match on energy alone (any BPM).
+            segments.append(Segment(run_part, kind, duration, None if kind == "strength" else pace))
 
         if rest_m:
             value = int(rest_m.group(1))
@@ -269,7 +277,8 @@ def _segment_pool(
         if seg.bpm:
             dist = pool["Tempo"].map(lambda t: _bpm_distance(float(t), seg.bpm))
         else:
-            dist = pd.Series(0.0, index=pool.index)
+            # No tempo target (strength): keep each artist's highest-energy track
+            dist = -pool["Energy"].astype(float)
         if played:
             dist = dist + pool["Track URI"].isin(played) * 1000.0
         pool = pool.loc[dist.sort_values(kind="stable").index]
@@ -438,6 +447,7 @@ def build_workout_playlist(
                     "easy": "Conversational effort - chilled, laid-back, mellow; nothing aggressive or high-energy.",
                     "cooldown": "Winding down - relaxed and light.",
                     "rest": "Recovery - calm.",
+                    "strength": "Strength training - up-tempo, high-energy, powerful and motivating; any BPM.",
                 }[seg.kind]
             )
             try:
