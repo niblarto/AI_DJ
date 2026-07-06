@@ -41,7 +41,7 @@ from flask import Flask, Response, jsonify, request
 from bpm_matcher.camelot import to_camelot
 
 from .llm import DEFAULT_MODEL
-from .workout import DEFAULT_EASY_PACE, build_workout_playlist, parse_workout
+from .workout import DEFAULT_EASY_PACE, build_workout_playlist, max_projected_duration, parse_workout
 
 app = Flask(__name__)
 app.config["USE_LLM"] = True
@@ -114,12 +114,17 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
     if not isinstance(played, list):
         played = None
 
+    bpm_overrides = body.get("bpmOverrides")
+    if not isinstance(bpm_overrides, dict):
+        bpm_overrides = None
+
     use_llm = app.config["USE_LLM"] and body.get("useLlm", True)
     try:
         playlist = build_workout_playlist(
             segments, library, model=app.config["MODEL"], use_llm=use_llm,
             cadence_buckets=buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
-            played_tracks=played, progress=progress,
+            played_tracks=played, bpm_overrides=bpm_overrides,
+            min_total_sec=max_projected_duration(segments_text), progress=progress,
         )
     except ValueError as e:
         return {"error": str(e)}, 422

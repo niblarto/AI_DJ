@@ -29,9 +29,28 @@ from .selector import _log, choose_setlist
 
 BPM_TOLERANCES = (3.0, 5.0, 8.0)
 DEFAULT_EASY_PACE = 555  # 9:15/mi - conversational, per the Runna plan
-# Extra music beyond the workout's length so the playlist doesn't run out
-# during pauses (shoelaces, traffic lights, walking it off afterwards).
+# Fallback pad when the workout card has no projected-duration range: a
+# little extra music so the playlist doesn't run out during pauses.
 PLAYLIST_PAD_SEC = 300
+
+# "1h50m - 2h10m" or "35m - 45m" in the card's summary line
+_DUR_RANGE_RE = re.compile(r"(?:(\d+)\s*h\s*)?(\d+)\s*m(?:in)?s?\b", re.IGNORECASE)
+
+
+def max_projected_duration(lines: list[str]) -> float | None:
+    """Upper bound of the workout's projected duration, from the card's
+    summary line ("Long Run • 13.1mi • 1h50m - 2h10m" -> 2h10m). This is the
+    slowest projection, so a playlist that long can't run out mid-run even on
+    a bad day. None when no summary line carries a duration."""
+    best = None
+    for line in lines:
+        if "•" not in line:
+            continue
+        for m in _DUR_RANGE_RE.finditer(line):
+            sec = int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60
+            if sec > 0:
+                best = max(best or 0, sec)
+    return best
 
 # Energy envelope per segment kind (relaxed in steps when the pool runs dry).
 ENERGY_BOUNDS = {
@@ -42,10 +61,31 @@ ENERGY_BOUNDS = {
     "rest": (0.00, 0.50),
 }
 
-# Kinds where the energy cap outranks BPM matching: the cap stays firm and
-# the BPM tolerance widens (eventually off) instead — an easy run should get
-# chilled tunes, not 172-BPM drum and bass that happens to match the cadence.
+# Easy-effort kinds: get the calmer end of the energy envelope and the
+# easy-pace bias. NOTE: BPM matching still outranks energy for these — the
+# runner locks cadence to the music, so tempo stays tight for every kind and
+# the energy window pads open instead when the pool runs dry.
 CHILL_KINDS = {"easy", "cooldown", "rest"}
+
+def _effective_run_tempo(tempo: float) -> float:
+    # Below ~95 BPM a runner locks onto double-time; above it, the raw tempo.
+    return tempo * 2 if tempo < 95 else tempo
+
+
+def _kind_bpm_bounds(kind: str, overrides: dict | None) -> tuple[float | None, float | None]:
+    """(min, max) BPM for a run type, from the Settings-page overrides.
+    No override = no hard limits (automatic cadence matching only). Bounds
+    compare against _effective_run_tempo, so half-time tracks count doubled."""
+    o = (overrides or {}).get(kind)
+    if isinstance(o, dict):
+        try:
+            lo = float(o["min"]) if o.get("min") else None
+            hi = float(o["max"]) if o.get("max") else None
+        except (TypeError, ValueError):
+            lo = hi = None
+        if lo is not None or hi is not None:
+            return lo, hi
+    return None, None
 
 # Thumbs up/down from the app applies to paces within this window (sec/mi):
 # a downvoted track is excluded from segments near that pace, an upvoted one
@@ -187,28 +227,30 @@ def _bpm_distance(tempo: float, bpm: float) -> float:
 def _segment_pool(
     library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float,
     easy_bias_sec: float = 0.0, used_artists: set | None = None, played: set | None = None,
+    bpm_bounds: tuple[float | None, float | None] = (None, None),
 ) -> pd.DataFrame:
+    lo, hi = bpm_bounds
+    if lo is not None or hi is not None:
+        eff = library["Tempo"].map(lambda t: _effective_run_tempo(float(t)))
+        mask = pd.Series(True, index=library.index)
+        if lo is not None:
+            mask &= eff >= lo
+        if hi is not None:
+            mask &= eff <= hi
+        library = library[mask]
     e_lo, e_hi = ENERGY_BOUNDS[seg.kind]
     # Runner has been going faster than target on easy runs — calm the music
     # down further: ~0.05 off the energy ceiling per 10 s/mi of overshoot.
     if seg.kind in CHILL_KINDS and easy_bias_sec > 0:
         e_hi = max(0.35, e_hi - min(0.15, easy_bias_sec * 0.005))
-    if seg.kind in CHILL_KINDS:
-        # Chill kinds hold the energy cap and let BPM drift (None = unfiltered)
-        # before the cap lifts — an easy run should get chilled tunes, not
-        # 172-BPM drum and bass that happens to match the cadence.
-        attempts = [
-            (tol, pad)
-            for pad in (0.0, 0.05, 0.15, 0.30, 0.45)
-            for tol in BPM_TOLERANCES + (12.0, None)
-        ]
-    else:
-        # Effort kinds keep BPM tight and pad the energy window open instead.
-        attempts = [(tol, pad) for tol in BPM_TOLERANCES for pad in (0.0, 0.1, 0.2, 1.0)]
-        # Last resorts: with one track per artist, a long segment can exhaust
-        # the unique artists near the target BPM — better off-tempo music at
-        # the back of the pool than silence mid-run.
-        attempts += [(12.0, 1.0), (None, 1.0)]
+    # BPM outranks energy for every kind: hold the tolerance tight and pad the
+    # energy window open instead. Use the Run BPM limits in Settings to steer
+    # tempo per run type (e.g. easy max 168).
+    attempts = [(tol, pad) for tol in BPM_TOLERANCES for pad in (0.0, 0.1, 0.2, 0.45, 1.0)]
+    # Last resorts: with one track per artist, a long segment can exhaust the
+    # unique artists near the target BPM — better off-tempo music at the back
+    # of the pool than silence mid-run.
+    attempts += [(12.0, 1.0), (None, 1.0)]
     for tol, pad in attempts:
         pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
         pool = pool[
@@ -283,6 +325,8 @@ def build_workout_playlist(
     easy_bias_sec: float = 0.0,
     track_feedback: list[dict] | None = None,
     played_tracks: list[dict] | None = None,
+    bpm_overrides: dict | None = None,
+    min_total_sec: float | None = None,
     progress=None,
 ) -> pd.DataFrame:
     """Fill every segment with BPM-matched tracks; returns rows with a
@@ -309,9 +353,23 @@ def build_workout_playlist(
             if seg.kind in CHILL_KINDS:
                 pace += easy_bias_sec
             seg.bpm = pace_to_bpm(pace, cadence_buckets)
+            # Clamp the target into the run type's bounds so BPM matching
+            # aims inside the window instead of fighting the hard filter.
+            lo, hi = _kind_bpm_bounds(seg.kind, bpm_overrides)
+            if seg.bpm and hi is not None:
+                seg.bpm = min(seg.bpm, hi)
+            if seg.bpm and lo is not None:
+                seg.bpm = max(seg.bpm, lo)
 
-    # Pad the final segment so the playlist outlasts the workout a little.
-    segments[-1].duration_sec += PLAYLIST_PAD_SEC
+    # Cover the workout's slowest projected duration rather than appending
+    # arbitrary padding tracks: stretch the final segment's budget only by
+    # whatever the segment targets fall short of it. Without a projection,
+    # fall back to the old fixed pad.
+    total = sum(s.duration_sec for s in segments)
+    if min_total_sec and min_total_sec > total:
+        segments[-1].duration_sec += min_total_sec - total
+    elif not min_total_sec:
+        segments[-1].duration_sec += PLAYLIST_PAD_SEC
 
     parts: list[pd.DataFrame] = []
     used: set = set()
@@ -356,7 +414,11 @@ def build_workout_playlist(
         downvoted = _feedback_uris(seg.pace_sec, "down")
         played = _played_uris(seg.pace_sec)
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
-        pool = _segment_pool(lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec, used_artists=used_artists, played=played)
+        pool = _segment_pool(
+            lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec,
+            used_artists=used_artists, played=played,
+            bpm_bounds=_kind_bpm_bounds(seg.kind, bpm_overrides),
+        )
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue
