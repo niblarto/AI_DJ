@@ -235,7 +235,7 @@ def _bpm_distance(tempo: float, bpm: float) -> float:
 def _segment_pool(
     library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float,
     easy_bias_sec: float = 0.0, used_artists: set | None = None, played: set | None = None,
-    bpm_bounds: tuple[float | None, float | None] = (None, None),
+    bpm_bounds: tuple[float | None, float | None] = (None, None), avoid: set | None = None,
 ) -> pd.DataFrame:
     lo, hi = bpm_bounds
     if lo is not None or hi is not None:
@@ -286,6 +286,14 @@ def _segment_pool(
         # The pool must be able to fill the whole segment — a 2h long run
         # needs far more than min_pool tracks.
         if len(pool) >= min_pool and pool["Duration (ms)"].sum() / 1000 >= budget_sec:
+            # Remix: a tight pool can be nothing but the avoided tracks, and
+            # demoting them changes nothing — keep widening until fresh music
+            # alone covers the budget (the tol=None last resort still returns
+            # whatever exists, so genuinely dry pools fall back gracefully).
+            if avoid and tol is not None:
+                fresh_sec = pool.loc[~pool["Track URI"].isin(avoid), "Duration (ms)"].sum() / 1000
+                if fresh_sec < budget_sec:
+                    continue
             return pool.reset_index(drop=True)
     return pool.reset_index(drop=True)
 
@@ -336,6 +344,8 @@ def build_workout_playlist(
     played_tracks: list[dict] | None = None,
     bpm_overrides: dict | None = None,
     min_total_sec: float | None = None,
+    avoid_tracks: list[str] | None = None,
+    effort: str | None = None,
     progress=None,
 ) -> pd.DataFrame:
     """Fill every segment with BPM-matched tracks; returns rows with a
@@ -346,6 +356,10 @@ def build_workout_playlist(
     FEEDBACK_PACE_TOLERANCE of the vote's pace; upvoted ones are moved to
     the front of that segment's setlist so they play more often.
 
+    avoid_tracks: URIs from the mix being rebuilt ("Remix") — demoted the
+    same way as already-played tracks, at any pace, so a remix comes out
+    mostly different but the pool can still fall back on them if it runs dry.
+
     easy_bias_sec > 0 means recent easy runs came out that much faster than
     target (sec/mi): easy-type segments are then built as if their pace were
     that much slower (lower SPM) with a lower energy ceiling. Easy pace is a
@@ -355,6 +369,11 @@ def build_workout_playlist(
     segment starts building — lets callers stream a live progress bar (the
     per-segment LLM call is the slow part).
     """
+    # Tracks without a duration can't be time-budgeted — NaN would poison the
+    # cumulative sums ("cannot convert float NaN to integer"). Drop them.
+    if "Duration (ms)" in library.columns:
+        library = library[library["Duration (ms)"].notna()]
+
     easy_bias_sec = min(max(easy_bias_sec, 0.0), 30.0)
     for seg in segments:
         if seg.pace_sec:
@@ -406,6 +425,7 @@ def build_workout_playlist(
             and abs(float(p["paceSec"]) - pace_sec) <= FEEDBACK_PACE_TOLERANCE
         }
 
+    llm_failures: list[str] = []
     for seg_idx, seg in enumerate(segments):
         if progress:
             try:
@@ -421,12 +441,13 @@ def build_workout_playlist(
             continue
 
         downvoted = _feedback_uris(seg.pace_sec, "down")
-        played = _played_uris(seg.pace_sec)
+        avoid = set(avoid_tracks or [])
+        played = _played_uris(seg.pace_sec) | avoid
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
         pool = _segment_pool(
             lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec,
             used_artists=used_artists, played=played,
-            bpm_bounds=_kind_bpm_bounds(seg.kind, bpm_overrides),
+            bpm_bounds=_kind_bpm_bounds(seg.kind, bpm_overrides), avoid=avoid or None,
         )
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
@@ -451,22 +472,26 @@ def build_workout_playlist(
                 }[seg.kind]
             )
             try:
-                ordered, _ = choose_setlist(prompt, pool, n_est, model)
+                ordered, _ = choose_setlist(prompt, pool, n_est, model, effort=effort)
             except Exception as e:
                 _log(f"LLM selection failed for '{seg.label}' ({e}); using distance chain.")
+                llm_failures.append(f"{seg.label}: {e}")
         if ordered is None or ordered.empty:
             ordered = pool.iloc[_chain_order(pool, prev_tail)]
 
-        # Top up from the rest of the pool if the picks don't cover the budget.
+        # Always extend the ordering with the rest of the pool: the LLM's
+        # setlist is sized to the budget, so without the leftovers the
+        # played/avoided demotion below has no fresh alternatives to promote
+        # and demoted tracks still make the cut. Extras past the budget are
+        # never reached by _fit_duration, so undemoted mixes are unchanged.
         # Compare by Track URI, not index — choose_setlist resets its result's
         # index, so index-based exclusion would re-add already-picked tracks
         # (duplicate index labels then make _fit_duration's .loc explode each
         # pick into multiple rows).
-        if ordered["Duration (ms)"].sum() / 1000 < budget:
-            leftover = pool[~pool["Track URI"].isin(ordered["Track URI"])].reset_index(drop=True)
-            if not leftover.empty:
-                extra = leftover.iloc[_chain_order(leftover, ordered.tail(1))]
-                ordered = pd.concat([ordered, extra], ignore_index=True)
+        leftover = pool[~pool["Track URI"].isin(ordered["Track URI"])].reset_index(drop=True)
+        if not leftover.empty:
+            extra = leftover.iloc[_chain_order(leftover, ordered.tail(1))]
+            ordered = pd.concat([ordered, extra], ignore_index=True)
 
         # Played-but-unvoted tracks drop to the back of the ordering, so they
         # only make the cut when the unplayed pool can't fill the budget.
@@ -509,6 +534,10 @@ def build_workout_playlist(
     playlist = pd.concat(parts).reset_index(drop=True)
     ends = playlist["Duration (ms)"].cumsum() / 1000
     playlist["Starts At"] = (ends - playlist["Duration (ms)"] / 1000).map(_mmss)
+    # Segments where the LLM call failed and fell back to the deterministic
+    # distance-chain — surfaced by server.py/ai_dj_bridge.py as a warning so
+    # a rate-limited/quota-exhausted model doesn't silently degrade the mix.
+    playlist.attrs["llm_failures"] = llm_failures
     return playlist
 
 

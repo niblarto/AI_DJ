@@ -49,8 +49,8 @@ def _log(msg: str):
     print(msg, file=sys.stderr, flush=True)
 
 
-def extract_constraints(prompt: str, model: str) -> dict:
-    raw = chat_json(_CONSTRAINTS_SYSTEM, prompt, model=model)
+def extract_constraints(prompt: str, model: str, effort: str | None = None) -> dict:
+    raw = chat_json(_CONSTRAINTS_SYSTEM, prompt, model=model, **({"effort": effort} if effort else {}))
 
     def num(key, lo, hi):
         v = raw.get(key)
@@ -178,7 +178,8 @@ def _parse_picks(raw: dict, pool: pd.DataFrame) -> list[int]:
 
 
 def choose_setlist(
-    prompt: str, pool: pd.DataFrame, count: int, model: str, unique_artists: bool = False
+    prompt: str, pool: pd.DataFrame, count: int, model: str, unique_artists: bool = False,
+    effort: str | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """Ask the model to pick and order `count` tracks from the pool."""
     user = (
@@ -187,13 +188,14 @@ def choose_setlist(
         + ("Use each artist at most once - no two tracks by the same artist.\n" if unique_artists else "")
         + f"\nCandidates:\n{_format_pool(pool)}"
     )
-    raw = chat_json(_SETLIST_SYSTEM, user, model=model, temperature=0.4)
+    effort_kwargs = {"effort": effort} if effort else {}
+    raw = chat_json(_SETLIST_SYSTEM, user, model=model, temperature=0.4, **effort_kwargs)
     picks = _parse_picks(raw, pool)
 
     if not picks:
         _log("Model reply had no usable tracks; retrying once...")
         retry = user + '\n\nIMPORTANT: reply as {"setlist": [numbers], "reasoning": "..."} - candidate NUMBERS only.'
-        raw = chat_json(_SETLIST_SYSTEM, retry, model=model, temperature=0.2)
+        raw = chat_json(_SETLIST_SYSTEM, retry, model=model, temperature=0.2, **effort_kwargs)
         picks = _parse_picks(raw, pool)
     if not picks:
         raise ValueError(f"Model returned no usable track picks: {raw}")

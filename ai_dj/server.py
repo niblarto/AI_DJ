@@ -25,7 +25,9 @@ POST /mix
                     startsAt, tempo, camelot, energy}]}]
     }
 
-GET /health -> {"ok": true, "llm": true|false}
+GET /health -> {"ok": true, "llm": true|false, "claude": true|false}
+GET /usage -> {"models": {"claude-sonnet-5": {"inputTokens", "outputTokens", "requests", "estimatedCostUsd"}, ...}}
+POST /settings/claude-key {"apiKey": "sk-ant-..."} -> {"ok": true}
 """
 
 import argparse
@@ -40,7 +42,15 @@ from flask import Flask, Response, jsonify, request
 
 from bpm_matcher.camelot import to_camelot
 
-from .llm import DEFAULT_MODEL
+from .llm import (
+    CLAUDE_MODELS,
+    DEFAULT_CLAUDE_EFFORT,
+    DEFAULT_MODEL,
+    estimate_cost_usd,
+    get_claude_usage,
+    get_llm_log,
+    is_claude_model,
+)
 from .workout import DEFAULT_EASY_PACE, build_workout_playlist, max_projected_duration, parse_workout
 
 app = Flask(__name__)
@@ -74,7 +84,57 @@ def health():
             llm_ok = rq.get(f"{OLLAMA_URL}/api/tags", timeout=3).ok
         except Exception:
             pass
-    return jsonify({"ok": True, "llm": llm_ok})
+
+    claude_ok = False
+    try:
+        from .llm import _get_claude_client
+        _get_claude_client()
+        claude_ok = True
+    except Exception:
+        pass
+
+    return jsonify({"ok": True, "llm": llm_ok, "claude": claude_ok, "claudeModels": CLAUDE_MODELS})
+
+
+@app.post("/settings/claude-key")
+def set_claude_key():
+    """Saves the Claude API key sent by the Running app's Settings page.
+    Also drops the cached client so the next request picks up the new key."""
+    body = request.get_json(force=True) or {}
+    api_key = (body.get("apiKey") or "").strip()
+    if not api_key:
+        return jsonify({"error": "apiKey required"}), 400
+
+    from . import claude_config, llm
+    claude_config.save_claude_api_key(api_key)
+    with llm._claude_client_lock:
+        llm._claude_client = None
+    return jsonify({"ok": True})
+
+
+@app.get("/llm-log")
+def llm_log():
+    """Prompts sent to the LLM on this host (Ollama mixes run here) — merged
+    with the Pi's own log by the Running app's Settings page."""
+    return jsonify({"entries": get_llm_log()})
+
+
+@app.get("/usage")
+def usage():
+    """Claude API token usage per model since this service process started,
+    for the Settings page's usage bars — see lib/ai-dj-config.ts / SettingsClient."""
+    by_model = get_claude_usage()
+    return jsonify({
+        "models": {
+            model: {
+                "inputTokens": u["input_tokens"],
+                "outputTokens": u["output_tokens"],
+                "requests": u["requests"],
+                "estimatedCostUsd": round(estimate_cost_usd(model, u), 4),
+            }
+            for model, u in by_model.items()
+        },
+    })
 
 
 def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
@@ -118,13 +178,23 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
     if not isinstance(bpm_overrides, dict):
         bpm_overrides = None
 
+    avoid = body.get("avoidTracks")
+    if not isinstance(avoid, list):
+        avoid = None
+
+    # Caller (Running app Settings) can pick a Claude model instead of the
+    # server-startup Ollama default; effort only applies to Claude.
+    model = body.get("model") or app.config["MODEL"]
+    effort = (body.get("effort") or DEFAULT_CLAUDE_EFFORT) if is_claude_model(model) else None
+
     use_llm = app.config["USE_LLM"] and body.get("useLlm", True)
     try:
         playlist = build_workout_playlist(
-            segments, library, model=app.config["MODEL"], use_llm=use_llm,
+            segments, library, model=model, use_llm=use_llm,
             cadence_buckets=buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
             played_tracks=played, bpm_overrides=bpm_overrides,
-            min_total_sec=max_projected_duration(segments_text), progress=progress,
+            min_total_sec=max_projected_duration(segments_text), avoid_tracks=avoid,
+            effort=effort, progress=progress,
         )
     except ValueError as e:
         return {"error": str(e)}, 422
@@ -154,10 +224,15 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
             }
         )
 
+    llm_failures = playlist.attrs.get("llm_failures") or []
     return {
         "trackUris": [u for u in playlist["Track URI"] if isinstance(u, str)],
         "totalSec": float(playlist["Duration (ms)"].sum() / 1000),
         "timeline": timeline,
+        # Segments where the model call failed (rate limit, quota, network)
+        # and fell back to the deterministic distance-chain — the Running
+        # app surfaces this as a warning instead of a silently lesser mix.
+        "llmFailures": llm_failures,
     }, 200
 
 

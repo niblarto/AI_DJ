@@ -2,6 +2,10 @@ pandas
 numpy
 requests
 flask
+# optional: Claude API setlist selection (Settings -> AI DJ -> Claude)
+anthropic
+# optional: Gemini API setlist selection (Settings -> AI DJ -> Gemini)
+google-genai
 # optional: read tags when scanning --music-dir
 mutagen
 # optional: offline BPM/key/energy analysis in the library scanner
