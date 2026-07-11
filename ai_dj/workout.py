@@ -425,13 +425,19 @@ def build_workout_playlist(
             and abs(float(p["paceSec"]) - pace_sec) <= FEEDBACK_PACE_TOLERANCE
         }
 
+    def _progress(seg_idx: int, label: str, detail: str | None = None):
+        if not progress:
+            return
+        try:
+            progress(seg_idx, len(segments), label, detail)
+        except TypeError:
+            progress(seg_idx, len(segments), label)  # older 3-arg callers
+        except Exception:
+            pass
+
     llm_failures: list[str] = []
     for seg_idx, seg in enumerate(segments):
-        if progress:
-            try:
-                progress(seg_idx, len(segments), seg.label)
-            except Exception:
-                pass
+        _progress(seg_idx, seg.label)
         is_last = seg is segments[-1]
         budget = seg.duration_sec - carry
         # Previous overshoot already covers this segment (but the final
@@ -445,7 +451,7 @@ def build_workout_playlist(
         played = _played_uris(seg.pace_sec) | avoid
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
         pool = _segment_pool(
-            lib_for_seg, seg, used, min_pool=8, budget_sec=budget, easy_bias_sec=easy_bias_sec,
+            lib_for_seg, seg, used, min_pool=20, budget_sec=budget, easy_bias_sec=easy_bias_sec,
             used_artists=used_artists, played=played,
             bpm_bounds=_kind_bpm_bounds(seg.kind, bpm_overrides), avoid=avoid or None,
         )
@@ -471,11 +477,14 @@ def build_workout_playlist(
                     "strength": "Strength training - up-tempo, high-energy, powerful and motivating; any BPM.",
                 }[seg.kind]
             )
+            _progress(seg_idx, seg.label, f"Sending {len(pool)} candidates to {model}…")
             try:
                 ordered, _ = choose_setlist(prompt, pool, n_est, model, effort=effort)
+                _progress(seg_idx, seg.label, f"{model} returned {len(ordered)} tracks")
             except Exception as e:
                 _log(f"LLM selection failed for '{seg.label}' ({e}); using distance chain.")
                 llm_failures.append(f"{seg.label}: {e}")
+                _progress(seg_idx, seg.label, f"{model} call failed — falling back to BPM matching")
         if ordered is None or ordered.empty:
             ordered = pool.iloc[_chain_order(pool, prev_tail)]
 
