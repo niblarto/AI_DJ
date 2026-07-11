@@ -31,23 +31,38 @@ prompt ──▶ LLM (Ollama): extract constraints (BPM range, energy, count)
                    playlist.m3u8 ──▶ Mixxx Auto DJ
 ```
 
+This is the free-text/CLI pipeline. [Workout mode](#workout-mode-runna) (the
+PaceSync integration) builds a candidate pool per workout section instead,
+with no upper cap — see that section for how it differs.
+
 ## Setup
 
+0. **Cloud LLM backends (optional)** — the setlist LLM call can also run
+   against the Claude API or the Gemini API instead of a local Ollama model
+   (useful for workout mode when the always-on-required Ollama PC isn't
+   available; PaceSync's on-Pi bridge calls these directly). Set
+   `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`, or save a key via
+   `claude_config.save_claude_api_key()` / the equivalent Gemini config, or
+   through the service's `POST /settings/claude-key`. `is_claude_model()` /
+   `is_gemini_model()` in `ai_dj/llm.py` dispatch by model ID — see
+   `CLAUDE_MODELS` / `GEMINI_MODELS` there for the current selectable set.
 1. **Ollama** — install from https://ollama.com/download/windows, then:
    ```
-   ollama pull mistral-nemo:12b
+   ollama pull qwen3.5:9b
    ```
-   Default model is `mistral-nemo:12b` (better constraint extraction and
-   energy-arc quality than `qwen2.5:7b` in side-by-side testing; `qwen2.5:7b`
-   is noticeably faster if that trade isn't worth it: `ollama pull qwen2.5:7b`
-   then set `AI_DJ_MODEL=qwen2.5:7b` or pass `--model qwen2.5:7b`). On a
-   10GB GPU, `mistral-nemo:12b` needs `num_ctx` capped at 9728 to stay fully
-   on-GPU (measured: 9728 holds at 100% GPU, 10240 already spills ~7% to
-   CPU) - the pipeline sets this by default. `qwen2.5:14b` and `phi4:14b` were
-   also tried as middle-ground options but neither fits on a 10GB card even
-   at num_ctx=8192 (23-35% spills to CPU), so they're not worth pulling here;
-   `gemma2:9b` fits fully on-GPU but its native context tops out at 8192,
-   below what the candidate-pool prompt needs.
+   Default model is `qwen3.5:9b` (`DEFAULT_MODEL` in `ai_dj/llm.py`, override
+   with `AI_DJ_MODEL` or `--model`). `qwen3.5:9b` is a reasoning model — the
+   Ollama request sends `think: false` so its output goes straight to
+   `message.content` instead of being consumed by hidden reasoning tokens
+   (otherwise `format: json` + a bounded `num_predict` can come back with an
+   empty `content` on a model that "thinks" before answering). On a 10GB GPU,
+   `num_ctx` is capped at 9728 to stay fully on-GPU for larger models
+   (measured against `mistral-nemo:12b`: 9728 holds at 100% GPU, 10240
+   already spills ~7% to CPU) — the pipeline sets this by default regardless
+   of which model you pull. `qwen2.5:14b` and `phi4:14b` were also tried as
+   middle-ground options but neither fits on a 10GB card even at num_ctx=8192
+   (23-35% spills to CPU); `gemma2:9b` fits fully on-GPU but its native
+   context tops out at 8192, below what the candidate-pool prompt needs.
 2. **Python deps** — `pip install -r requirements.txt` (or reuse the AI_BPM
    venv, which already has everything except mutagen).
 3. **bpm_matcher** — expected at `E:\Code\AI_BPM`; override with the
@@ -71,7 +86,7 @@ Options:
 | `-n N` | Force track count (default: inferred from prompt, else 15) |
 | `--music-dir DIR` | Also scan this folder for local audio files |
 | `--mixxxdb PATH` | Mixxx database (default: `%LOCALAPPDATA%\Mixxx\mixxxdb.sqlite`) |
-| `--model NAME` | Ollama model (default `mistral-nemo:12b`, or `AI_DJ_MODEL` env var) |
+| `--model NAME` | Ollama model (default `qwen3.5:9b`, or `AI_DJ_MODEL` env var) |
 | `--smooth` | Reorder the picks by weighted BPM/key/feel distance for smoother transitions |
 | `--arc` | Reorder as a rising energy arc (mellow opener → peak-energy closer) |
 
@@ -145,19 +160,51 @@ python -m ai_dj.workout workouts\steady-into-tempo.txt --csv E:\Code\Running\Run
   changes land on track boundaries, balanced to stay near the pace-change time.
 - `--no-llm` skips Ollama entirely (deterministic BPM/key/feel chaining) —
   runs fine on a Raspberry Pi.
+- **Candidate pool per section**: unlike the free-text CLI/service pipeline
+  above (capped at `MAX_CANDIDATES`, 140), workout mode's `_segment_pool()`
+  in `ai_dj/workout.py` sends the model *every* track that survives that
+  section's BPM/energy filter — there's no upper cap. `min_pool` (currently
+  `20`, passed from `build_workout_playlist()`) only controls how far the
+  BPM-tolerance/energy-window widens before the pool is accepted, i.e. the
+  floor the loop stops at, not a sample size — if 80 tracks pass the filter
+  at that tolerance step, all 80 go to the LLM.
 
 ## Service mode (PaceSync integration)
 
-`python -m ai_dj.server [--port 8765] [--no-llm]` exposes the workout mixer
-over HTTP for the PaceSync running app:
+`python -m ai_dj.server [--port 8765] [--no-llm] [--model NAME]` exposes the
+workout mixer over HTTP for the PaceSync running app:
 
-- `POST /mix` `{title, segments, csv, easyPace?, useLlm?}` →
-  `{trackUris, totalSec, timeline}`
-- `GET /health` → `{ok, llm}`
+- `POST /mix` `{title, segments, csv, easyPace?, useLlm?, model?, effort?,
+  cadenceBuckets?, trackFeedback?, playedTracks?, bpmOverrides?,
+  avoidTracks?}` → `{trackUris, totalSec, timeline, llmFailures}`
+- `POST /mix/stream` — same body as `/mix`, but streams Server-Sent Events as
+  each segment builds: `{"type":"progress","current","total","segment",
+  "detail"?}` (detail carries the LLM interaction status for that segment —
+  candidates sent, tracks returned, or a fallback notice), then
+  `{"type":"done",...mix}` or `{"type":"error","error"}`. `detail` is
+  populated from `build_workout_playlist`'s progress callback in
+  `ai_dj/workout.py`.
+- `GET /health` → `{ok, llm, claude, claudeModels}`
+- `GET /usage` → per-model Claude/Gemini token usage and estimated cost since
+  this process started (`ai_dj/llm.py`'s usage-tracking file)
+- `GET /llm-log` → the last 50 LLM calls made on this host (prompt, model,
+  ok/error, duration) — merged with PaceSync's own on-Pi log on the Settings
+  page so Claude/Gemini calls (which run on the Pi) and Ollama calls (which
+  run here) show up in one place, tagged by source.
+- `POST /settings/claude-key` `{apiKey}` — saves a Claude API key the service
+  should use, dropping the cached client so the next request picks it up.
 
-The PaceSync side (Settings → 🎧 AI DJ → service URL + enable) adds an
-**AI DJ Mix** button to each Runna workout card, which builds the mix and
-creates/updates a Spotify playlist named `DD-MM-YY <Workout name>`.
+`llmFailures` lists segments where the model call errored (rate limit, quota,
+network) and fell back to the deterministic distance-chain, so a degraded
+mix is surfaced instead of shipping silently.
+
+The PaceSync side (Settings → 🎧 AI DJ → service URL + enable, or Claude/Gemini
+API key + model) adds an **AI DJ Mix** button to each Runna workout card,
+which builds the mix and creates/updates a Spotify playlist named
+`DD-MM-YY <Workout name>`. Claude and Gemini mixes actually run on the Pi
+itself via a small bridge script rather than calling out to this service, so
+they don't depend on the service host being on — only Ollama-backed mixes
+need this service reachable.
 
 ## Windows services
 
@@ -198,10 +245,18 @@ and crossfading. (Options → Preferences → Auto DJ to tune transition length.
 ## Environment variables
 
 - `OLLAMA_URL` — Ollama endpoint (default `http://localhost:11434`)
-- `AI_DJ_MODEL` — default model name
+- `AI_DJ_MODEL` — default model name (default `qwen3.5:9b`)
 - `AI_BPM_PATH` — bpm_matcher repo location
 - `LASTFM_API_KEY` — enables the Last.fm autocorrect step in the library
   scanner ([get a key](https://www.last.fm/api/account/create))
+- `ANTHROPIC_API_KEY` — Claude API key; alternative to saving one via
+  `claude_config`/`POST /settings/claude-key`
+- `GEMINI_API_KEY` — Gemini API key; alternative to saving one via
+  `gemini_config`
+- `AI_DJ_USAGE_FILE` — path to the Claude/Gemini token-usage tracking file
+  (default: `ai-dj-usage.json` next to the `ai_dj/` package)
+- `AI_DJ_LLM_LOG_FILE` — path to the rolling LLM-call log file that backs
+  `GET /llm-log` (default: `ai-dj-llm-log.json` next to the `ai_dj/` package)
 
 Secrets and machine-local values can live in a git-ignored `.env.local` at
 the repo root (`KEY=value` lines, loaded on import; real environment

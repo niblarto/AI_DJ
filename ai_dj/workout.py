@@ -259,6 +259,23 @@ def _segment_pool(
     # unique artists near the target BPM — better off-tempo music at the back
     # of the pool than silence mid-run.
     attempts += [(12.0, 1.0), (None, 1.0)]
+
+    # The last attempt (no BPM filter, energy fully padded) is the widest
+    # possible pool for this segment - the ceiling of what's available once
+    # already-used tracks/artists are excluded. Send the LLM a healthy slice
+    # of that ceiling rather than stopping at the bare min_pool floor: at
+    # least min_pool tracks, but never less than a third of what's out there.
+    tol, pad = attempts[-1]
+    widest = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
+    widest = widest[
+        (widest["Energy"] >= max(e_lo - pad, 0)) & (widest["Energy"] <= min(e_hi + pad, 1))
+    ]
+    widest = widest[~widest["Track URI"].isin(used)] if "Track URI" in widest.columns else widest
+    if used_artists:
+        widest = widest[~widest["Artist Name(s)"].map(_primary_artist).isin(used_artists)]
+    max_available = widest["Artist Name(s)"].map(_primary_artist).nunique()
+    min_pool = max(min_pool, math.ceil(max_available / 3))
+
     for tol, pad in attempts:
         pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
         pool = pool[
