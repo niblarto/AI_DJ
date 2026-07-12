@@ -70,6 +70,18 @@ ENERGY_BOUNDS = {
 # the energy window pads open instead when the pool runs dry.
 CHILL_KINDS = {"easy", "cooldown", "rest"}
 
+# BPM tolerance widens further for warmup/easy/cooldown/rest before landing
+# on a pool - these are paces where a wider tempo spread doesn't hurt (a
+# runner isn't locked to the beat as tightly at an easy effort), so a bigger
+# pool of decent-fit music beats a small pool of exact-fit music. "work" (the
+# hard-effort segments - tempo, intervals, time trials, where pace really
+# counts) stays on the tight default tolerance, so the LLM only ever sees
+# close-to-target candidates. The Run BPM limits ceiling (Settings) still
+# applies on top of either — this only controls how far the *search* widens
+# before accepting a pool, not the hard min/max bound.
+WIDE_TOLERANCE_KINDS = {"warmup", "easy", "cooldown", "rest"}
+BPM_TOLERANCES_WIDE = (3.0, 5.0, 8.0, 12.0)
+
 def _effective_run_tempo(tempo: float) -> float:
     # Below ~95 BPM a runner locks onto double-time; above it, the raw tempo.
     return tempo * 2 if tempo < 95 else tempo
@@ -253,28 +265,15 @@ def _segment_pool(
         e_hi = max(0.35, e_hi - min(0.15, easy_bias_sec * 0.005))
     # BPM outranks energy for every kind: hold the tolerance tight and pad the
     # energy window open instead. Use the Run BPM limits in Settings to steer
-    # tempo per run type (e.g. easy max 168).
-    attempts = [(tol, pad) for tol in BPM_TOLERANCES for pad in (0.0, 0.1, 0.2, 0.45, 1.0)]
+    # tempo per run type (e.g. easy max 168). Hard-effort ("work") segments
+    # keep the tight default tolerance since pace really counts there;
+    # warmup/easy/cooldown/rest can widen further — see WIDE_TOLERANCE_KINDS.
+    tolerances = BPM_TOLERANCES_WIDE if seg.kind in WIDE_TOLERANCE_KINDS else BPM_TOLERANCES
+    attempts = [(tol, pad) for tol in tolerances for pad in (0.0, 0.1, 0.2, 0.45, 1.0)]
     # Last resorts: with one track per artist, a long segment can exhaust the
     # unique artists near the target BPM — better off-tempo music at the back
     # of the pool than silence mid-run.
     attempts += [(12.0, 1.0), (None, 1.0)]
-
-    # The last attempt (no BPM filter, energy fully padded) is the widest
-    # possible pool for this segment - the ceiling of what's available once
-    # already-used tracks/artists are excluded. Send the LLM a healthy slice
-    # of that ceiling rather than stopping at the bare min_pool floor: at
-    # least min_pool tracks, but never less than a third of what's out there.
-    tol, pad = attempts[-1]
-    widest = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
-    widest = widest[
-        (widest["Energy"] >= max(e_lo - pad, 0)) & (widest["Energy"] <= min(e_hi + pad, 1))
-    ]
-    widest = widest[~widest["Track URI"].isin(used)] if "Track URI" in widest.columns else widest
-    if used_artists:
-        widest = widest[~widest["Artist Name(s)"].map(_primary_artist).isin(used_artists)]
-    max_available = widest["Artist Name(s)"].map(_primary_artist).nunique()
-    min_pool = max(min_pool, math.ceil(max_available / 3))
 
     for tol, pad in attempts:
         pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
@@ -494,9 +493,17 @@ def build_workout_playlist(
                     "strength": "Strength training - up-tempo, high-energy, powerful and motivating; any BPM.",
                 }[seg.kind]
             )
+            target_bpm_str = f"{seg.bpm:.0f}" if seg.bpm else "none"
+            _log(
+                f"'{seg.label}': sending {len(pool)} candidates to {model} "
+                f"(target {target_bpm_str} BPM, pool range "
+                f"{pool['Tempo'].min():.0f}-{pool['Tempo'].max():.0f} BPM, count target {n_est})"
+            )
             _progress(seg_idx, seg.label, f"Sending {len(pool)} candidates to {model}…")
             try:
                 ordered, _ = choose_setlist(prompt, pool, n_est, model, effort=effort)
+                picked_bpm = ordered["Tempo"].tolist() if not ordered.empty else []
+                _log(f"'{seg.label}': {model} returned {len(ordered)} tracks, BPMs: {picked_bpm}")
                 _progress(seg_idx, seg.label, f"{model} returned {len(ordered)} tracks")
             except Exception as e:
                 _log(f"LLM selection failed for '{seg.label}' ({e}); using distance chain.")

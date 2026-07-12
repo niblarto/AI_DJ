@@ -18,7 +18,7 @@ from bpm_matcher.match import bpm_filter, cross_distance_matrix
 
 from .llm import chat_json
 
-MAX_CANDIDATES = 140
+MAX_CANDIDATES = 150
 
 _CONSTRAINTS_SYSTEM = """\
 You extract DJ-set constraints from a request. Reply with ONLY a JSON object:
@@ -182,27 +182,38 @@ def choose_setlist(
     effort: str | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """Ask the model to pick and order `count` tracks from the pool."""
+    # Cap what's actually shown to the LLM: past ~150-200 candidates, local
+    # models (qwen3.5:9b, measured empirically) start genuinely losing track
+    # of the numeric BPM data in a long list — quality collapses (picks
+    # drift 40+ BPM off target) well before the call ever errors out, so this
+    # can't rely on catching a failure downstream. Callers (e.g. workout.py's
+    # _segment_pool) already sort by BPM-closeness, so truncating keeps the
+    # closest matches and only drops the long tail. The full `pool` is still
+    # returned to the caller for duration/leftover bookkeeping — only the
+    # prompt and index resolution are scoped to the visible slice.
+    visible_pool = pool.head(MAX_CANDIDATES) if len(pool) > MAX_CANDIDATES else pool
+
     user = (
         f"Request: {prompt}\n"
         f"Pick exactly {count} tracks.\n"
         + ("Use each artist at most once - no two tracks by the same artist.\n" if unique_artists else "")
-        + f"\nCandidates:\n{_format_pool(pool)}"
+        + f"\nCandidates:\n{_format_pool(visible_pool)}"
     )
     effort_kwargs = {"effort": effort} if effort else {}
     raw = chat_json(_SETLIST_SYSTEM, user, model=model, temperature=0.4, **effort_kwargs)
-    picks = _parse_picks(raw, pool)
+    picks = _parse_picks(raw, visible_pool)
 
     if not picks:
         _log("Model reply had no usable tracks; retrying once...")
         retry = user + '\n\nIMPORTANT: reply as {"setlist": [numbers], "reasoning": "..."} - candidate NUMBERS only.'
         raw = chat_json(_SETLIST_SYSTEM, retry, model=model, temperature=0.2, **effort_kwargs)
-        picks = _parse_picks(raw, pool)
+        picks = _parse_picks(raw, visible_pool)
     if not picks:
         raise ValueError(f"Model returned no usable track picks: {raw}")
     if len(picks) < count:
         _log(f"Model picked {len(picks)}/{count} usable tracks; continuing with those.")
 
-    setlist = pool.iloc[picks[:count]].reset_index(drop=True)
+    setlist = visible_pool.iloc[picks[:count]].reset_index(drop=True)
     return setlist, str(raw.get("reasoning", ""))
 
 
