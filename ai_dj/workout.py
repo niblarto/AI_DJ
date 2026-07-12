@@ -192,11 +192,16 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
             # BPM-matched tracks instead of leaving seg.bpm unset.
             segments.append(Segment(rest_m.group(0), "rest", rest_sec, easy_pace_sec))
 
-    # Music plays through short rests - fold them into the previous segment.
+    # Music plays through short rests - fold them into the previous segment's
+    # track-fill pass (a standalone segment this short would force an early,
+    # cut-off track change just for the rest). The label still records the
+    # fold so downstream UI (e.g. the activity timeline strip) can show the
+    # rest as its own block even though it shares tracks with what preceded it.
     merged: list[Segment] = []
     for seg in segments:
         if seg.kind == "rest" and seg.duration_sec < 120 and merged:
             merged[-1].duration_sec += seg.duration_sec
+            merged[-1].label = f"{merged[-1].label} + {seg.label}"
         else:
             merged.append(seg)
     return merged
@@ -547,6 +552,12 @@ def build_workout_playlist(
         ordered = ordered[~ordered["Artist Name(s)"].map(_primary_artist).duplicated()]
 
         chosen = _fit_duration(ordered, budget, overshoot=is_last).copy()
+        # Playback order within the segment: slowest BPM first, building up to
+        # the fastest — track *selection* above (LLM picks, played/boosted
+        # demotion, artist dedup, budget fit) is untouched; this only resorts
+        # the segment's already-chosen tracks before they're written out.
+        if len(chosen) > 1:
+            chosen = chosen.sort_values("Tempo", kind="stable")
         chosen["Segment"] = seg.label
         chosen["Target BPM"] = seg.bpm
         chosen["Target Pace"] = seg.pace_sec  # sec/mi, for post-run pace review
