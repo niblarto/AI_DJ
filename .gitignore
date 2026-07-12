@@ -17,3 +17,4 @@ mix*.csv
 # Machine-local secrets
 .env.local
 ai-dj-llm-log.json
+ai-dj-llm-log.json
