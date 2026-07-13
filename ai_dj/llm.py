@@ -360,7 +360,7 @@ def chat_json(
     entry = {
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "model": model,
-        "system": system[:500],
+        "system": system[:_PROMPT_LOG_CHARS] + ("…" if len(system) > _PROMPT_LOG_CHARS else ""),
         "prompt": user[:_PROMPT_LOG_CHARS] + ("…" if len(user) > _PROMPT_LOG_CHARS else ""),
     }
     start = time.monotonic()
