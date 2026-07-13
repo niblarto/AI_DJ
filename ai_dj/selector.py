@@ -40,10 +40,12 @@ candidate tracks with BPM, Camelot key, energy, danceability and valence
 candidate under 95 BPM as if its BPM were doubled when judging how it fits
 the request or compares to other tracks' pace - e.g. an 86 BPM track reads
 as ~172 BPM for these purposes, not as a slow track.
-Pick tracks that fit the request and order them in ascending effective BPM
-(slowest first, building up to the fastest, using the doubled value for
-sub-95 BPM tracks), while keeping keys harmonically compatible where
-possible (same/adjacent Camelot numbers).
+Pick tracks that fit the request and order them so effective BPM never
+decreases (using the doubled value for sub-95 BPM tracks) - it's fine, and
+often better, for consecutive tracks to sit at the same or very similar BPM
+rather than always climbing; don't force a spread-out staircase just to make
+BPM rise. Keep keys harmonically compatible where possible (same/adjacent
+Camelot numbers).
 Reply with ONLY a JSON object holding the track NUMBERS in play order, e.g.:
 {"setlist": [17, 4, 62, 31], "reasoning": "one short paragraph"}
 Do not repeat the track details in your reply - numbers only. Use each track
