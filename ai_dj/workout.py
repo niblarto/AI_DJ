@@ -29,6 +29,9 @@ from .selector import _log, choose_setlist
 
 BPM_TOLERANCES = (3.0, 5.0, 8.0)
 DEFAULT_EASY_PACE = 555  # 9:15/mi - conversational, per the Runna plan
+# A rest explicitly described as "walking" (vs. a jogging/easy-pace rest) is
+# never faster than a 20:00/mi walk, regardless of the configured easy pace.
+WALKING_REST_MIN_PACE_SEC = 1200
 # Fallback pad when the workout card has no projected-duration range: a
 # little extra music so the playlist doesn't run out during pauses.
 PLAYLIST_PAD_SEC = 300
@@ -189,8 +192,13 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
             rest_sec = value * 60 if rest_m.group(2).startswith("min") else value
             # Give standalone rests (>=120s, so not folded into the prior
             # segment below) an easy/recovery pace so they still get
-            # BPM-matched tracks instead of leaving seg.bpm unset.
-            segments.append(Segment(rest_m.group(0), "rest", rest_sec, easy_pace_sec))
+            # BPM-matched tracks instead of leaving seg.bpm unset. A rest
+            # explicitly called out as "walking" is slower still - floor it
+            # at 20:00/mi rather than the (jogging-speed) easy pace.
+            rest_pace = easy_pace_sec
+            if "walk" in rest_m.group(0).lower():
+                rest_pace = max(rest_pace, WALKING_REST_MIN_PACE_SEC)
+            segments.append(Segment(rest_m.group(0), "rest", rest_sec, rest_pace))
 
     # Music plays through short rests - fold them into the previous segment's
     # track-fill pass (a standalone segment this short would force an early,
@@ -552,12 +560,15 @@ def build_workout_playlist(
         ordered = ordered[~ordered["Artist Name(s)"].map(_primary_artist).duplicated()]
 
         chosen = _fit_duration(ordered, budget, overshoot=is_last).copy()
-        # Playback order within the segment: slowest BPM first, building up to
-        # the fastest — track *selection* above (LLM picks, played/boosted
-        # demotion, artist dedup, budget fit) is untouched; this only resorts
-        # the segment's already-chosen tracks before they're written out.
+        # Playback order within the segment: slowest effective BPM first,
+        # building up to the fastest (sub-95 BPM tracks sort by their doubled
+        # tempo, same convention as BPM matching elsewhere) — track
+        # *selection* above (LLM picks, played/boosted demotion, artist
+        # dedup, budget fit) is untouched; this only resorts the segment's
+        # already-chosen tracks before they're written out.
         if len(chosen) > 1:
-            chosen = chosen.sort_values("Tempo", kind="stable")
+            eff_tempo = chosen["Tempo"].map(lambda t: _effective_run_tempo(float(t)))
+            chosen = chosen.loc[eff_tempo.sort_values(kind="stable").index]
         chosen["Segment"] = seg.label
         chosen["Target BPM"] = seg.bpm
         chosen["Target Pace"] = seg.pace_sec  # sec/mi, for post-run pace review

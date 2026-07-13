@@ -36,9 +36,14 @@ imply BPM unless the genre strongly does (e.g. drum & bass ~170-180, house
 _SETLIST_SYSTEM = """\
 You are a DJ building a setlist. You get a request and a numbered list of
 candidate tracks with BPM, Camelot key, energy, danceability and valence
-(0-1). Pick tracks that fit the request and order them as a coherent set:
-smooth BPM progression, harmonically compatible keys where possible
-(same/adjacent Camelot numbers), and an energy arc that suits the request.
+(0-1). A runner's cadence locks onto double-time below ~95 BPM, so treat any
+candidate under 95 BPM as if its BPM were doubled when judging how it fits
+the request or compares to other tracks' pace - e.g. an 86 BPM track reads
+as ~172 BPM for these purposes, not as a slow track.
+Pick tracks that fit the request and order them in ascending effective BPM
+(slowest first, building up to the fastest, using the doubled value for
+sub-95 BPM tracks), while keeping keys harmonically compatible where
+possible (same/adjacent Camelot numbers).
 Reply with ONLY a JSON object holding the track NUMBERS in play order, e.g.:
 {"setlist": [17, 4, 62, 31], "reasoning": "one short paragraph"}
 Do not repeat the track details in your reply - numbers only. Use each track
