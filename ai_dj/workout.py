@@ -25,7 +25,7 @@ import pandas as pd
 
 from bpm_matcher.match import bpm_filter, cross_distance_matrix
 
-from .selector import _log, choose_setlist
+from .selector import _log, choose_setlist, MAX_CANDIDATES
 
 BPM_TOLERANCES = (3.0, 5.0, 8.0)
 DEFAULT_EASY_PACE = 555  # 9:15/mi - conversational, per the Runna plan
@@ -109,6 +109,13 @@ def _kind_bpm_bounds(kind: str, overrides: dict | None) -> tuple[float | None, f
 # a downvoted track is excluded from segments near that pace, an upvoted one
 # is pulled to the front of the segment's setlist.
 FEEDBACK_PACE_TOLERANCE = 10.0
+
+# BPM-distance-equivalent penalty added per confirmed-mix play — a graded
+# nudge favoring less-played tracks in the candidate pool. Tuned against the
+# tight BPM tolerances (3-12, see BPM_TOLERANCES/_WIDE): a track played 4+
+# times needs a real BPM edge to still beat a never-played one, but a single
+# past play barely matters against a clearly-closer BPM match.
+PLAY_COUNT_WEIGHT = 1.5
 
 
 @dataclass
@@ -261,6 +268,7 @@ def _segment_pool(
     library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float,
     easy_bias_sec: float = 0.0, used_artists: set | None = None, played: set | None = None,
     bpm_bounds: tuple[float | None, float | None] = (None, None), avoid: set | None = None,
+    play_counts: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     lo, hi = bpm_bounds
     if lo is not None or hi is not None:
@@ -308,6 +316,13 @@ def _segment_pool(
         else:
             # No tempo target (strength): keep each artist's highest-energy track
             dist = -pool["Energy"].astype(float)
+        if play_counts:
+            # Least-played tracks sort earlier: a graded nudge (not the hard
+            # +1000 played/avoid penalty below), so a frequently-played track
+            # only loses out to close-but-less-played alternatives rather
+            # than being excluded outright - it can still win on BPM alone
+            # against something far off-tempo but never played.
+            dist = dist + pool["Track URI"].map(lambda u: play_counts.get(u, 0)) * PLAY_COUNT_WEIGHT
         if played:
             dist = dist + pool["Track URI"].isin(played) * 1000.0
         pool = pool.loc[dist.sort_values(kind="stable").index]
@@ -371,6 +386,7 @@ def build_workout_playlist(
     easy_bias_sec: float = 0.0,
     track_feedback: list[dict] | None = None,
     played_tracks: list[dict] | None = None,
+    play_counts: dict[str, int] | None = None,
     bpm_overrides: dict | None = None,
     min_total_sec: float | None = None,
     avoid_tracks: list[str] | None = None,
@@ -388,6 +404,15 @@ def build_workout_playlist(
     avoid_tracks: URIs from the mix being rebuilt ("Remix") — demoted the
     same way as already-played tracks, at any pace, so a remix comes out
     mostly different but the pool can still fall back on them if it runs dry.
+
+    play_counts: {uri: confirmed-mix-appearance-count} across all history,
+    not just this pace band. Used as a graded tiebreaker within the BPM-
+    sorted candidate pool — least-played tracks sort earlier, so they're
+    more likely to survive the MAX_CANDIDATES cut and be shown to the LLM.
+    This is separate from played_tracks' pace-specific hard demotion: a
+    track can be low-priority here (played often) while still being
+    eligible, unlike played_tracks which pushes same-pace repeats to the
+    very back of the per-artist dedup.
 
     easy_bias_sec > 0 means recent easy runs came out that much faster than
     target (sec/mi): easy-type segments are then built as if their pace were
@@ -481,7 +506,7 @@ def build_workout_playlist(
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
         pool = _segment_pool(
             lib_for_seg, seg, used, min_pool=20, budget_sec=budget, easy_bias_sec=easy_bias_sec,
-            used_artists=used_artists, played=played,
+            used_artists=used_artists, played=played, play_counts=play_counts,
             bpm_bounds=_kind_bpm_bounds(seg.kind, bpm_overrides), avoid=avoid or None,
         )
         if pool.empty:
@@ -507,12 +532,18 @@ def build_workout_playlist(
                 }[seg.kind]
             )
             target_bpm_str = f"{seg.bpm:.0f}" if seg.bpm else "none"
+            # choose_setlist only ever shows the model the first MAX_CANDIDATES
+            # rows of the pool (closest-BPM first) - report that capped count
+            # as what's "sent", plus the full pool size when it's bigger, so
+            # the progress line doesn't overstate how many the LLM actually sees.
+            sent_count = min(len(pool), MAX_CANDIDATES)
+            pool_desc = f"{sent_count} candidates" if sent_count == len(pool) else f"{sent_count} of {len(pool)} candidates"
             _log(
-                f"'{seg.label}': sending {len(pool)} candidates to {model} "
+                f"'{seg.label}': sending {pool_desc} to {model} "
                 f"(target {target_bpm_str} BPM, pool range "
                 f"{pool['Tempo'].min():.0f}-{pool['Tempo'].max():.0f} BPM, count target {n_est})"
             )
-            _progress(seg_idx, seg.label, f"Sending {len(pool)} candidates to {model}…")
+            _progress(seg_idx, seg.label, f"Sending {pool_desc} to {model}…")
             try:
                 ordered, _ = choose_setlist(prompt, pool, n_est, model, effort=effort)
                 picked_bpm = ordered["Tempo"].tolist() if not ordered.empty else []

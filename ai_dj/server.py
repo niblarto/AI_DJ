@@ -174,6 +174,10 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
     if not isinstance(played, list):
         played = None
 
+    play_counts = body.get("playCounts")
+    if not isinstance(play_counts, dict):
+        play_counts = None
+
     bpm_overrides = body.get("bpmOverrides")
     if not isinstance(bpm_overrides, dict):
         bpm_overrides = None
@@ -192,7 +196,7 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
         playlist = build_workout_playlist(
             segments, library, model=model, use_llm=use_llm,
             cadence_buckets=buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
-            played_tracks=played, bpm_overrides=bpm_overrides,
+            played_tracks=played, play_counts=play_counts, bpm_overrides=bpm_overrides,
             min_total_sec=max_projected_duration(segments_text), avoid_tracks=avoid,
             effort=effort, progress=progress,
         )
