@@ -51,7 +51,7 @@ from .llm import (
     get_llm_log,
     is_claude_model,
 )
-from .workout import DEFAULT_EASY_PACE, build_workout_playlist, max_projected_duration, parse_workout
+from .workout import DEFAULT_EASY_PACE, build_flow_mix, build_workout_playlist, max_projected_duration, parse_workout
 
 app = Flask(__name__)
 app.config["USE_LLM"] = True
@@ -204,7 +204,16 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
         return {"error": str(e)}, 422
 
     timeline = []
-    for seg_label, group in playlist.groupby("Segment", sort=False):
+    # Group by contiguous block, not raw label — a repeated segment label
+    # (e.g. a "1mi at 8:55/mi" step reused later in a progressive/repeat
+    # workout) must not merge with its earlier, non-adjacent occurrence:
+    # groupby("Segment") on the label alone did that, splicing two separate
+    # chronological ranges into one out-of-order timeline entry (visible as
+    # a forked BPM line on the mix chart, since track rows within the
+    # merged "segment" were no longer time-ordered).
+    block_id = (playlist["Segment"] != playlist["Segment"].shift()).cumsum()
+    for _, group in playlist.groupby(block_id, sort=False):
+        seg_label = group["Segment"].iloc[0]
         target_pace = group["Target Pace"].iloc[0] if "Target Pace" in group.columns else None
         target_bpm = group["Target BPM"].iloc[0]
         timeline.append(
@@ -238,6 +247,125 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
         # app surfaces this as a warning instead of a silently lesser mix.
         "llmFailures": llm_failures,
     }, 200
+
+
+def _build_flow_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
+    """Shared /flow-mix and /flow-mix/stream builder — returns (payload, http_status).
+
+    Unlike /mix, this takes a fixed track-URI pool (e.g. every track in a
+    selected HR zone) and just sequences it for smooth transitions instead
+    of picking tracks to fit workout segments."""
+    title = body.get("title") or "Flow Mix"
+    track_uris = body.get("trackUris") or []
+    csv_text = body.get("csv") or ""
+    if not track_uris or not csv_text:
+        return {"error": "trackUris and csv are required"}, 400
+
+    try:
+        library = _load_library(csv_text)
+    except Exception as e:
+        return {"error": f"Could not parse library CSV: {e}"}, 400
+
+    feedback = body.get("trackFeedback")
+    if not isinstance(feedback, list):
+        feedback = None
+
+    play_counts = body.get("playCounts")
+    if not isinstance(play_counts, dict):
+        play_counts = None
+
+    try:
+        budget_sec = float(body["durationSec"]) if body.get("durationSec") is not None else None
+    except (TypeError, ValueError):
+        budget_sec = None
+
+    model = body.get("model") or app.config["MODEL"]
+    effort = (body.get("effort") or DEFAULT_CLAUDE_EFFORT) if is_claude_model(model) else None
+    use_llm = app.config["USE_LLM"] and body.get("useLlm", True)
+
+    try:
+        playlist = build_flow_mix(
+            title, library, track_uris, model=model, use_llm=use_llm,
+            track_feedback=feedback, play_counts=play_counts, effort=effort, progress=progress,
+            budget_sec=budget_sec,
+        )
+    except ValueError as e:
+        return {"error": str(e)}, 422
+
+    timeline = [{
+        "segment": title,
+        "targetBpm": None,
+        "targetPaceSec": None,
+        "tracks": [
+            {
+                "uri": row.get("Track URI"),
+                "name": row["Track Name"],
+                "artist": row["Artist Name(s)"],
+                "startsAt": row["Starts At"],
+                "durationSec": float(row["Duration (ms)"] / 1000),
+                "tempo": float(row["Tempo"]),
+                "camelot": row["Camelot"],
+                "energy": float(row["Energy"]),
+            }
+            for _, row in playlist.iterrows()
+        ],
+    }]
+
+    llm_failures = playlist.attrs.get("llm_failures") or []
+    return {
+        "trackUris": [u for u in playlist["Track URI"] if isinstance(u, str)],
+        "totalSec": float(playlist["Duration (ms)"].sum() / 1000),
+        "timeline": timeline,
+        "llmFailures": llm_failures,
+    }, 200
+
+
+@app.post("/flow-mix")
+def flow_mix():
+    payload, status = _build_flow_mix_payload(request.get_json(force=True))
+    return jsonify(payload), status
+
+
+@app.post("/flow-mix/stream")
+def flow_mix_stream():
+    """SSE variant of /flow-mix — see /mix/stream for the event shape."""
+    body = request.get_json(force=True)
+    q: "queue.Queue[dict]" = queue.Queue()
+
+    def worker():
+        try:
+            payload, status = _build_flow_mix_payload(
+                body,
+                progress=lambda done, total, label, detail=None: q.put(
+                    {"type": "progress", "current": done, "total": total, "segment": label, "detail": detail}
+                ),
+            )
+            if status == 200:
+                q.put({"type": "done", **payload})
+            else:
+                q.put({"type": "error", "error": payload.get("error", f"flow-mix failed ({status})")})
+        except Exception as e:
+            q.put({"type": "error", "error": str(e)})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def gen():
+        yield ": " + "x" * 1024 + "\n\n"
+        while True:
+            try:
+                msg = q.get(timeout=15)
+            except queue.Empty:
+                yield ": hb\n\n"
+                continue
+            yield f"data: {json.dumps(msg)}\n\n"
+            if msg["type"] in ("done", "error"):
+                return
+
+    return Response(
+        gen(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/mix")

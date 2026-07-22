@@ -25,7 +25,7 @@ import pandas as pd
 
 from bpm_matcher.match import bpm_filter, cross_distance_matrix
 
-from .selector import _log, choose_setlist, MAX_CANDIDATES
+from .selector import _log, choose_flow_order, choose_setlist, MAX_CANDIDATES
 
 BPM_TOLERANCES = (3.0, 5.0, 8.0)
 DEFAULT_EASY_PACE = 555  # 9:15/mi - conversational, per the Runna plan
@@ -260,7 +260,13 @@ def _primary_artist(name) -> str:
 
 
 def _bpm_distance(tempo: float, bpm: float) -> float:
-    """Distance to target allowing half/double-time matches, mirroring bpm_filter."""
+    """Distance to target allowing half/double-time matches, mirroring bpm_filter.
+
+    Always symmetric, even for "work" segments (see bpm_filter's
+    no_upper_limit) - an on-target track should still rank ahead of an
+    unnecessarily fast one; only bpm_filter's exclusion cutoff is asymmetric,
+    not this ranking distance.
+    """
     return min(abs(tempo - bpm), abs(tempo * 2 - bpm), abs(tempo / 2 - bpm))
 
 
@@ -296,8 +302,13 @@ def _segment_pool(
     # of the pool than silence mid-run.
     attempts += [(12.0, 1.0), (None, 1.0)]
 
+    # Hard-effort segments: running faster than the planned pace is fine
+    # (even good), so a track above target BPM is never filtered out or
+    # penalized for it - only a track slower than target is a real mismatch.
+    no_upper_limit = seg.kind == "work"
+
     for tol, pad in attempts:
-        pool = bpm_filter(library, seg.bpm, tolerance=tol) if seg.bpm and tol else library
+        pool = bpm_filter(library, seg.bpm, tolerance=tol, no_upper_limit=no_upper_limit) if seg.bpm and tol else library
         pool = pool[
             (pool["Energy"] >= max(e_lo - pad, 0))
             & (pool["Energy"] <= min(e_hi + pad, 1))
@@ -318,15 +329,24 @@ def _segment_pool(
             dist = -pool["Energy"].astype(float)
         if play_counts:
             # Least-played tracks sort earlier: a graded nudge (not the hard
-            # +1000 played/avoid penalty below), so a frequently-played track
-            # only loses out to close-but-less-played alternatives rather
-            # than being excluded outright - it can still win on BPM alone
+            # played/avoid split below), so a frequently-played track only
+            # loses out to close-but-less-played alternatives rather than
+            # being excluded outright - it can still win on BPM alone
             # against something far off-tempo but never played.
             dist = dist + pool["Track URI"].map(lambda u: play_counts.get(u, 0)) * PLAY_COUNT_WEIGHT
-        if played:
-            dist = dist + pool["Track URI"].isin(played) * 1000.0
         pool = pool.loc[dist.sort_values(kind="stable").index]
         pool = pool.loc[~pool["Artist Name(s)"].map(_primary_artist).duplicated()]
+        # Fresh tracks always precede played/avoided ones as two separate
+        # blocks (not a combined distance score) - with a large pool, a
+        # blended "+1000 penalty" can still let a played/avoided track land
+        # ahead of some fresh ones by index once the fresh block runs past
+        # MAX_CANDIDATES, since only the pool's *row order* determines what
+        # choose_setlist's head(MAX_CANDIDATES) slice actually shows the LLM.
+        # A hard split guarantees every fresh track outranks every
+        # played/avoided one regardless of pool size.
+        if played:
+            is_played = pool["Track URI"].isin(played)
+            pool = pd.concat([pool[~is_played], pool[is_played]])
         # The pool must be able to fill the whole segment — a 2h long run
         # needs far more than min_pool tracks.
         if len(pool) >= min_pool and pool["Duration (ms)"].sum() / 1000 >= budget_sec:
@@ -524,7 +544,7 @@ def build_workout_playlist(
                 f"{cadence_line}"
                 + {
                     "warmup": "Easing in - upbeat but not full throttle.",
-                    "work": "Hard effort - driving, motivating, relentless.",
+                    "work": "Hard effort - driving, motivating, relentless. Faster than the cadence target is fine, even better - only slower tracks are a mismatch here.",
                     "easy": "Conversational effort - chilled, laid-back, mellow; nothing aggressive or high-energy.",
                     "cooldown": "Winding down - relaxed and light.",
                     "rest": "Recovery - calm.",
@@ -631,6 +651,96 @@ def _mmss(sec: float) -> str:
     return f"{int(sec // 60)}:{int(sec % 60):02d}"
 
 
+def build_flow_mix(
+    title: str,
+    library: pd.DataFrame,
+    track_uris: list[str],
+    model: str,
+    use_llm: bool = True,
+    track_feedback: list[dict] | None = None,
+    play_counts: dict[str, int] | None = None,
+    effort: str | None = None,
+    progress=None,
+    budget_sec: float | None = None,
+) -> pd.DataFrame:
+    """Sequence a fixed, caller-chosen set of tracks (e.g. every track in a
+    selected HR zone) for smooth transitions, instead of picking tracks to
+    fit workout segments. BPM/energy/key act only as a local
+    smoothness guide between neighbouring tracks - never a target to hit.
+
+    Without budget_sec, every track in `track_uris` that exists in the
+    library appears exactly once in the result (nothing is filtered out by
+    pace/BPM fit). With budget_sec (e.g. the next scheduled run's estimated
+    duration), the flow-ordered list is trimmed to that length the same way
+    a workout segment is (_fit_duration) - the track that crosses the
+    boundary is only kept when overshooting beats stopping short.
+
+    track_feedback: [{"uri", "vote": "up"|"down"}] - downvoted tracks are
+    dropped outright (no pace scoping, unlike the segment-based mixer,
+    since a flow mix has no per-track pace target); upvoted tracks are
+    boosted to sort earlier as a tiebreak.
+
+    play_counts: {uri: confirmed-mix-appearance-count} - a graded tiebreak,
+    least-played tracks sort earlier; ties are broken by the model/chain
+    order rather than being excluded outright.
+    """
+    pool = library[library["Track URI"].isin(track_uris)].reset_index(drop=True)
+    if "Duration (ms)" in pool.columns:
+        pool = pool[pool["Duration (ms)"].notna()]
+    if pool.empty:
+        raise ValueError("None of the selected tracks were found in the library.")
+
+    downvoted = {f.get("uri") for f in (track_feedback or []) if f.get("vote") == "down" and f.get("uri")}
+    upvoted = {f.get("uri") for f in (track_feedback or []) if f.get("vote") == "up" and f.get("uri")}
+    if downvoted:
+        pool = pool[~pool["Track URI"].isin(downvoted)].reset_index(drop=True)
+    if pool.empty:
+        raise ValueError("Every selected track was thumbs-downed.")
+
+    if play_counts:
+        weight = pool["Track URI"].map(lambda u: play_counts.get(u, 0)) * PLAY_COUNT_WEIGHT
+        pool = pool.loc[weight.sort_values(kind="stable").index].reset_index(drop=True)
+
+    if progress:
+        try:
+            progress(0, 1, title, f"Sending {min(len(pool), MAX_CANDIDATES)} tracks to {model}…" if use_llm else None)
+        except Exception:
+            pass
+
+    ordered = None
+    llm_failures: list[str] = []
+    if use_llm:
+        try:
+            ordered, _ = choose_flow_order(pool, model, effort=effort)
+        except Exception as e:
+            _log(f"Flow-mix LLM ordering failed ({e}); using distance chain.")
+            llm_failures.append(f"{title}: {e}")
+    if ordered is None or ordered.empty:
+        ordered = pool.iloc[_chain_order(pool, None)].reset_index(drop=True)
+
+    if upvoted:
+        is_boost = ordered["Track URI"].isin(upvoted)
+        if is_boost.any():
+            ordered = pd.concat([ordered[is_boost], ordered[~is_boost]]).reset_index(drop=True)
+
+    if budget_sec is not None and ordered["Duration (ms)"].sum() / 1000 > budget_sec:
+        ordered = _fit_duration(ordered, budget_sec).reset_index(drop=True)
+
+    if progress:
+        try:
+            progress(1, 1, title, f"{model} returned {len(ordered)} tracks" if use_llm else None)
+        except Exception:
+            pass
+
+    ends = ordered["Duration (ms)"].cumsum() / 1000
+    ordered["Starts At"] = (ends - ordered["Duration (ms)"] / 1000).map(_mmss)
+    ordered["Segment"] = title
+    ordered["Target BPM"] = pd.NA
+    ordered["Target Pace"] = pd.NA
+    ordered.attrs["llm_failures"] = llm_failures
+    return ordered
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -686,7 +796,9 @@ def main():
 
     total = playlist["Duration (ms)"].sum() / 1000
     print(f"\nWorkout playlist — {len(playlist)} tracks, {_mmss(total)} total:")
-    for seg_label, group in playlist.groupby("Segment", sort=False):
+    block_id = (playlist["Segment"] != playlist["Segment"].shift()).cumsum()
+    for _, group in playlist.groupby(block_id, sort=False):
+        seg_label = group["Segment"].iloc[0]
         bpm = group["Target BPM"].iloc[0]
         print(f"\n  ▶ {seg_label}  (target {bpm:.0f} BPM)")
         for _, row in group.iterrows():

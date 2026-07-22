@@ -51,6 +51,26 @@ Reply with ONLY a JSON object holding the track NUMBERS in play order, e.g.:
 Do not repeat the track details in your reply - numbers only. Use each track
 number at most once. Pick exactly the requested amount."""
 
+_FLOW_SYSTEM = """\
+You are a DJ sequencing a fixed set of tracks for a run - every track listed
+must appear exactly once in your reply, none dropped, none added. You get a
+numbered list of tracks with BPM, Camelot key, energy, danceability and
+valence (0-1). BPM here is NOT a target to hit - it's a guide for keeping the
+transition between consecutive tracks smooth: avoid jarring jumps in tempo
+or energy from one song to the next. A runner's cadence locks onto
+double-time below ~95 BPM, so treat any candidate under 95 BPM as if its BPM
+were doubled when judging its pace relative to other tracks - e.g. an 86 BPM
+track reads as ~172 BPM for this purpose, not as a slow track.
+Order the tracks into a sequence that flows well: neighbouring tracks should
+sit at similar effective BPM and compatible energy, with harmonically
+compatible keys where possible (same/adjacent Camelot numbers). The overall
+arc can rise, fall, or stay level - there's no fixed target - just avoid
+abrupt swings between adjacent tracks.
+Reply with ONLY a JSON object holding every track NUMBER in play order, e.g.:
+{"setlist": [17, 4, 62, 31], "reasoning": "one short paragraph"}
+Do not repeat the track details in your reply - numbers only. Every track
+number must appear exactly once."""
+
 
 def _log(msg: str):
     print(msg, file=sys.stderr, flush=True)
@@ -222,6 +242,37 @@ def choose_setlist(
 
     setlist = visible_pool.iloc[picks[:count]].reset_index(drop=True)
     return setlist, str(raw.get("reasoning", ""))
+
+
+def choose_flow_order(pool: pd.DataFrame, model: str, effort: str | None = None) -> tuple[pd.DataFrame, str]:
+    """Ask the model to sequence every track in `pool` for smooth run-mix
+    transitions (BPM/energy/key as a local-smoothness guide, not a target).
+
+    Unlike choose_setlist this never drops tracks: any the model's reply
+    omits are appended in pool order (BPM-closest-neighbour already applied
+    by the caller isn't assumed here, so leftovers just keep pool order).
+    """
+    visible_pool = pool.head(MAX_CANDIDATES) if len(pool) > MAX_CANDIDATES else pool
+
+    user = (
+        f"Sequence all {len(visible_pool)} tracks below for a run mix.\n\n"
+        f"Candidates:\n{_format_pool(visible_pool)}"
+    )
+    effort_kwargs = {"effort": effort} if effort else {}
+    raw = chat_json(_FLOW_SYSTEM, user, model=model, temperature=0.4, **effort_kwargs)
+    picks = _parse_picks(raw, visible_pool)
+
+    if len(picks) < len(visible_pool) * 0.5:
+        _log("Flow-order reply covered too few tracks; retrying once...")
+        retry = user + f'\n\nIMPORTANT: reply as {{"setlist": [numbers], "reasoning": "..."}} - ALL {len(visible_pool)} track NUMBERS, each exactly once.'
+        raw = chat_json(_FLOW_SYSTEM, retry, model=model, temperature=0.2, **effort_kwargs)
+        picks = _parse_picks(raw, visible_pool)
+    if not picks:
+        raise ValueError(f"Model returned no usable track picks: {raw}")
+
+    missing = [i for i in range(len(visible_pool)) if i not in set(picks)]
+    ordered = visible_pool.iloc[picks + missing].reset_index(drop=True)
+    return ordered, str(raw.get("reasoning", ""))
 
 
 def _row_artists(row) -> list[str]:
