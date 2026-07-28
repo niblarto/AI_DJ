@@ -345,7 +345,7 @@ def _segment_pool(
     library: pd.DataFrame, seg: Segment, used: set, min_pool: int, budget_sec: float,
     easy_bias_sec: float = 0.0, used_artists: set | None = None, played: set | None = None,
     bpm_bounds: tuple[float | None, float | None] = (None, None), avoid: set | None = None,
-    play_counts: dict[str, int] | None = None,
+    play_counts: dict[str, int] | None = None, boosted: set | None = None,
 ) -> pd.DataFrame:
     lo, hi = bpm_bounds
     if lo is not None or hi is not None:
@@ -401,9 +401,14 @@ def _segment_pool(
         if play_counts:
             # Hard tier by play count: weight is the primary sort key, dist
             # (BPM/energy fit) only breaks ties within the same play count —
-            # see PLAY_COUNT_WEIGHT above.
+            # see PLAY_COUNT_WEIGHT above. A thumbs-upped track always gets
+            # weight 0 regardless of how many times it's played, so it never
+            # loses a spot in the pool (and therefore the LLM's candidate
+            # list) to its own play count.
             weight = pool["Track URI"].map(lambda u: min(play_counts.get(u, 0), 10) * PLAY_COUNT_WEIGHT)
             weight = weight.clip(upper=PLAY_COUNT_WEIGHT_CAP)
+            if boosted:
+                weight = weight.where(~pool["Track URI"].isin(boosted), 0)
             pool = pool.loc[pd.DataFrame({"weight": weight, "dist": dist}).sort_values(["weight", "dist"], kind="stable").index]
         else:
             pool = pool.loc[dist.sort_values(kind="stable").index]
@@ -593,12 +598,13 @@ def build_workout_playlist(
             continue
 
         downvoted = _feedback_uris(seg.pace_sec, "down")
+        boosted = _feedback_uris(seg.pace_sec, "up")
         avoid = set(avoid_tracks or [])
         played = _played_uris(seg.pace_sec) | avoid
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
         pool = _segment_pool(
             lib_for_seg, seg, used, min_pool=20, budget_sec=budget, easy_bias_sec=easy_bias_sec,
-            used_artists=used_artists, played=played, play_counts=play_counts,
+            used_artists=used_artists, played=played, play_counts=play_counts, boosted=boosted or None,
             bpm_bounds=_kind_bpm_bounds(seg.kind, bpm_overrides), avoid=avoid or None,
         )
         if pool.empty:
@@ -664,7 +670,6 @@ def build_workout_playlist(
 
         # Played-but-unvoted tracks drop to the back of the ordering, so they
         # only make the cut when the unplayed pool can't fill the budget.
-        boosted = _feedback_uris(seg.pace_sec, "up")
         demoted = played - boosted
         if demoted:
             is_played = ordered["Track URI"].isin(demoted)
@@ -770,7 +775,10 @@ def build_flow_mix(
         raise ValueError("Every selected track was thumbs-downed.")
 
     if play_counts:
+        # A thumbs-upped track always gets weight 0 regardless of play count.
         weight = pool["Track URI"].map(lambda u: min(play_counts.get(u, 0), 10) * PLAY_COUNT_WEIGHT).clip(upper=PLAY_COUNT_WEIGHT_CAP)
+        if upvoted:
+            weight = weight.where(~pool["Track URI"].isin(upvoted), 0)
         pool = pool.loc[weight.sort_values(kind="stable").index].reset_index(drop=True)
 
     if progress:
