@@ -110,12 +110,16 @@ def _kind_bpm_bounds(kind: str, overrides: dict | None) -> tuple[float | None, f
 # is pulled to the front of the segment's setlist.
 FEEDBACK_PACE_TOLERANCE = 10.0
 
-# BPM-distance-equivalent penalty added per confirmed-mix play — a graded
-# nudge favoring less-played tracks in the candidate pool. Tuned against the
-# tight BPM tolerances (3-12, see BPM_TOLERANCES/_WIDE): a track played 4+
-# times needs a real BPM edge to still beat a never-played one, but a single
-# past play barely matters against a clearly-closer BPM match.
-PLAY_COUNT_WEIGHT = 1.5
+# Play-count weight: 0-1000, +100 per confirmed-mix play, capped at 1000.
+# This is a hard tier, not a graded nudge - every 0-play track sorts ahead of
+# every 1-play track regardless of BPM fit, every 1-play track ahead of every
+# 2-play track, and so on, with BPM distance only breaking ties *within* the
+# same play-count tier. So the candidate pool (and therefore what MAX_CANDIDATES
+# truncates down to before the LLM ever sees it) is drawn from the
+# least-played tracks first, only reaching further-played tracks once the
+# lower tiers can't fill the segment's duration budget on their own.
+PLAY_COUNT_WEIGHT = 100
+PLAY_COUNT_WEIGHT_CAP = 1000
 
 
 @dataclass
@@ -132,6 +136,19 @@ class Segment:
 _PACE_RE = re.compile(r"(\d+):(\d+)\s*/mi")
 _DIST_RE = re.compile(r"([\d.]+)\s*mi\b")
 _REST_RE = re.compile(r"(\d+)\s*(s|sec|secs|min|mins?)\b[^,]*\b(?:rest|walk)", re.IGNORECASE)
+# A "no faster than X/mi" (or "or slower") clause is a ceiling on an
+# easy/warmup/cooldown step, not its target pace - matching it as the
+# target reads a conversational warm up as a fast one. Strip it before
+# looking for the real target pace, which (if present at all) always comes
+# from the "at X/mi" part earlier in the line.
+_PACE_CEILING_RE = re.compile(r"\(?\s*(?:no faster than|or slower)\b.*?/mi\)?", re.IGNORECASE)
+# "5 reps of:" / "3 x of:" / "4 sets of:" header introducing a block of
+# lines to repeat N times - the block ends at the next line that isn't part
+# of it (blank, or itself another header/segment at the top level). Runna
+# renders the block's lines with no special indentation of their own, so
+# the only signal is this header line and the segment lines that follow
+# until the next non-continuation line.
+_REPS_RE = re.compile(r"^\s*(\d+)\s*(?:reps?|sets?|x)\s+of\s*:?\s*$", re.IGNORECASE)
 
 
 def _segment_kind(text: str) -> str:
@@ -149,13 +166,23 @@ def _segment_kind(text: str) -> str:
 
 def _is_segment_line(line: str) -> bool:
     """True for actual workout steps; false for card header lines like
-    "Tempo • 4.5mi • 35m - 45m" (distance/duration summary, no instruction)."""
-    if "•" in line:
+    "Tempo • 4.5mi • 35m - 45m" (distance/duration summary, no instruction).
+
+    "•" is overloaded in Runna's text: the card header uses it as a
+    "label • label • label" separator between several short fields, while a
+    reps-block body line uses it only as a single LEADING list marker
+    ("• 0.62mi at 7:25/mi ..."). Reject the former (2+ bullets, or a bullet
+    with no real instruction after it) but not the latter.
+    """
+    if line.count("•") >= 2:
         return False
-    t = line.lower()
+    stripped = line.lstrip("•").strip()
+    if "•" in stripped:
+        return False
+    t = stripped.lower()
     return bool(
-        _PACE_RE.search(line)
-        or _REST_RE.search(line)
+        _PACE_RE.search(stripped)
+        or _REST_RE.search(stripped)
         or " at " in t
         or "warm up" in t or "warmup" in t
         or "cool down" in t or "cooldown" in t
@@ -164,18 +191,62 @@ def _is_segment_line(line: str) -> bool:
     )
 
 
+def _expand_repeat_blocks(lines: list[str]) -> list[str]:
+    """Expand a "5 reps of:" header plus the single compound line that
+    follows it (e.g. "0.62mi at 7:25/mi ..., 90s walking rest") into 5
+    literal copies of that line, so the rest of the parser sees a flat list
+    exactly as if the block had been written out longhand.
+
+    Runna's plain-text export gives no indentation or other structural
+    marker for a block's body, so the body can't be told apart from a
+    following top-level line (e.g. a cooldown) by line count alone - only
+    the next single non-blank line is treated as the repeated body, which
+    matches every observed Runna repeat block (always one work[+rest] line).
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        m = _REPS_RE.match(line)
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        count = int(m.group(1))
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j < len(lines) and _is_segment_line(lines[j].strip()):
+            # Every rep's rest is short enough to fold into the work before
+            # it (see the merge pass in parse_workout), so the chart ends up
+            # showing one long flat segment with no visible sign the reps
+            # or rests exist at all - tag the label with "Nx ..." up front so
+            # it's clear this block was picked up and merged, not missed.
+            # Strip any leading bullet first so the prefix leads the line
+            # cleanly instead of landing before/after a stray "•".
+            body = lines[j].strip().lstrip("•").strip()
+            tagged = f"{count}x {body}" if count > 1 else body
+            for _ in range(max(count, 0)):
+                out.append(tagged)
+            i = j + 1
+        else:
+            i = j
+    return out
+
+
 def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) -> list[Segment]:
     """Parse Runna segment lines into Segments (rest parts split out)."""
     segments: list[Segment] = []
-    for raw in lines:
-        line = raw.strip()
+    for raw in _expand_repeat_blocks(lines):
+        line = raw.strip().lstrip("•").strip()
         if not line or not _is_segment_line(line):
             continue
 
         rest_m = _REST_RE.search(line)
         run_part = line[: rest_m.start()].rstrip(", ") if rest_m else line
 
-        pace_m = _PACE_RE.search(run_part)
+        pace_run_part = _PACE_CEILING_RE.sub("", run_part)
+        pace_m = _PACE_RE.search(pace_run_part)
         dist_m = _DIST_RE.search(run_part)
         pace = int(pace_m.group(1)) * 60 + int(pace_m.group(2)) if pace_m else easy_pace_sec
         if dist_m:
@@ -328,13 +399,14 @@ def _segment_pool(
             # No tempo target (strength): keep each artist's highest-energy track
             dist = -pool["Energy"].astype(float)
         if play_counts:
-            # Least-played tracks sort earlier: a graded nudge (not the hard
-            # played/avoid split below), so a frequently-played track only
-            # loses out to close-but-less-played alternatives rather than
-            # being excluded outright - it can still win on BPM alone
-            # against something far off-tempo but never played.
-            dist = dist + pool["Track URI"].map(lambda u: play_counts.get(u, 0)) * PLAY_COUNT_WEIGHT
-        pool = pool.loc[dist.sort_values(kind="stable").index]
+            # Hard tier by play count: weight is the primary sort key, dist
+            # (BPM/energy fit) only breaks ties within the same play count —
+            # see PLAY_COUNT_WEIGHT above.
+            weight = pool["Track URI"].map(lambda u: min(play_counts.get(u, 0), 10) * PLAY_COUNT_WEIGHT)
+            weight = weight.clip(upper=PLAY_COUNT_WEIGHT_CAP)
+            pool = pool.loc[pd.DataFrame({"weight": weight, "dist": dist}).sort_values(["weight", "dist"], kind="stable").index]
+        else:
+            pool = pool.loc[dist.sort_values(kind="stable").index]
         pool = pool.loc[~pool["Artist Name(s)"].map(_primary_artist).duplicated()]
         # Fresh tracks always precede played/avoided ones as two separate
         # blocks (not a combined distance score) - with a large pool, a
@@ -680,9 +752,9 @@ def build_flow_mix(
     since a flow mix has no per-track pace target); upvoted tracks are
     boosted to sort earlier as a tiebreak.
 
-    play_counts: {uri: confirmed-mix-appearance-count} - a graded tiebreak,
-    least-played tracks sort earlier; ties are broken by the model/chain
-    order rather than being excluded outright.
+    play_counts: {uri: confirmed-mix-appearance-count} - least-played tracks
+    sort earlier (see PLAY_COUNT_WEIGHT); ties within the same play count are
+    broken by the model/chain order rather than being excluded outright.
     """
     pool = library[library["Track URI"].isin(track_uris)].reset_index(drop=True)
     if "Duration (ms)" in pool.columns:
@@ -698,7 +770,7 @@ def build_flow_mix(
         raise ValueError("Every selected track was thumbs-downed.")
 
     if play_counts:
-        weight = pool["Track URI"].map(lambda u: play_counts.get(u, 0)) * PLAY_COUNT_WEIGHT
+        weight = pool["Track URI"].map(lambda u: min(play_counts.get(u, 0), 10) * PLAY_COUNT_WEIGHT).clip(upper=PLAY_COUNT_WEIGHT_CAP)
         pool = pool.loc[weight.sort_values(kind="stable").index].reset_index(drop=True)
 
     if progress:
