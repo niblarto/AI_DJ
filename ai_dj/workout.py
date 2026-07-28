@@ -245,10 +245,22 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
         rest_m = _REST_RE.search(line)
         run_part = line[: rest_m.start()].rstrip(", ") if rest_m else line
 
+        ceiling_m = _PACE_CEILING_RE.search(run_part)
         pace_run_part = _PACE_CEILING_RE.sub("", run_part)
         pace_m = _PACE_RE.search(pace_run_part)
         dist_m = _DIST_RE.search(run_part)
-        pace = int(pace_m.group(1)) * 60 + int(pace_m.group(2)) if pace_m else easy_pace_sec
+        if pace_m:
+            pace = int(pace_m.group(1)) * 60 + int(pace_m.group(2))
+        elif ceiling_m:
+            # No separate "at X:XX/mi" target — the ceiling clause ("no
+            # faster than X:XX/mi") is the only pace given for this segment,
+            # so it IS the target, not just a bound to check the target
+            # against. Search the ceiling text itself, not pace_run_part
+            # (which just had it stripped out).
+            ceiling_pace_m = _PACE_RE.search(ceiling_m.group(0))
+            pace = (int(ceiling_pace_m.group(1)) * 60 + int(ceiling_pace_m.group(2))) if ceiling_pace_m else easy_pace_sec
+        else:
+            pace = easy_pace_sec
         if dist_m:
             duration = float(dist_m.group(1)) * pace
         else:
