@@ -389,8 +389,9 @@ def mix_stream():
         try:
             payload, status = _build_mix_payload(
                 body,
-                progress=lambda done, total, label, detail=None: q.put(
-                    {"type": "progress", "current": done, "total": total, "segment": label, "detail": detail}
+                progress=lambda done, total, label, detail=None, candidate_uris=None: q.put(
+                    {"type": "progress", "current": done, "total": total, "segment": label, "detail": detail,
+                     "candidateUris": candidate_uris}
                 ),
             )
             if status == 200:

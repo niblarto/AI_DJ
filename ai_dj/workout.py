@@ -588,13 +588,16 @@ def build_workout_playlist(
             and abs(float(p["paceSec"]) - pace_sec) <= FEEDBACK_PACE_TOLERANCE
         }
 
-    def _progress(seg_idx: int, label: str, detail: str | None = None):
+    def _progress(seg_idx: int, label: str, detail: str | None = None, candidate_uris: list[str] | None = None):
         if not progress:
             return
         try:
-            progress(seg_idx, len(segments), label, detail)
+            progress(seg_idx, len(segments), label, detail, candidate_uris)
         except TypeError:
-            progress(seg_idx, len(segments), label)  # older 3-arg callers
+            try:
+                progress(seg_idx, len(segments), label, detail)
+            except TypeError:
+                progress(seg_idx, len(segments), label)  # older 3-arg callers
         except Exception:
             pass
 
@@ -653,7 +656,8 @@ def build_workout_playlist(
                 f"(target {target_bpm_str} BPM, pool range "
                 f"{pool['Tempo'].min():.0f}-{pool['Tempo'].max():.0f} BPM, count target {n_est})"
             )
-            _progress(seg_idx, seg.label, f"Sending {pool_desc} to {model}…")
+            candidate_uris = pool["Track URI"].head(MAX_CANDIDATES).tolist() if "Track URI" in pool.columns else None
+            _progress(seg_idx, seg.label, f"Sending {pool_desc} to {model}…", candidate_uris)
             try:
                 ordered, _ = choose_setlist(prompt, pool, n_est, model, effort=effort)
                 picked_bpm = ordered["Tempo"].tolist() if not ordered.empty else []
