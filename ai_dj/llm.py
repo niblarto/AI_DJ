@@ -6,6 +6,7 @@ chat_json(system, user, model, temperature) -> dict shape, so callers
 
 import json
 import os
+import sqlite3
 import threading
 
 import requests
@@ -71,21 +72,49 @@ def is_gemini_model(model: str) -> bool:
 
 
 # ── Usage tracking (hosted providers: Claude, Gemini) ────────────────────────
-# Persisted to a JSON file next to claude-config.json/gemini-config.json
-# rather than kept in memory: mixes run as a short-lived `ai_dj_bridge.py`
-# subprocess per mix (no long-running service process to hold counters
-# across calls) when built on the Pi directly, so a file is the only thing
-# that accumulates across mixes. "Session" here means "since this file was
-# last cleared", not a provider-account concept — the mixer calls the API
-# with a key, which has no claude.ai/aistudio-style session limit;
-# token/cost counters are what applies. Keyed by model, since each has
-# different per-token pricing.
+# Persisted to a row in the Running app's shared pacesync.db (kv_config
+# table, key "ai_dj_usage") rather than kept in memory: mixes run as a
+# short-lived `ai_dj_bridge.py` subprocess per mix (no long-running service
+# process to hold counters across calls) when built on the Pi directly, so a
+# durable store is the only thing that accumulates across mixes. "Session"
+# here means "since this was last cleared", not a provider-account concept —
+# the mixer calls the API with a key, which has no claude.ai/aistudio-style
+# session limit; token/cost counters are what applies. Keyed by model, since
+# each has different per-token pricing.
+#
+# _usage_lock only ever protected concurrent threads within one process —
+# moot here since each mix build is its own fresh subprocess anyway; SQLite's
+# busy_timeout (set on both this and the Node side) is what actually
+# protects a write here from colliding with the Running app's own reads.
 
 _usage_lock = threading.Lock()
-_usage_path = os.environ.get(
-    "AI_DJ_USAGE_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ai-dj-usage.json"),
+_usage_db_path = os.environ.get(
+    "AI_DJ_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pacesync.db"),
 )
+_USAGE_KEY = "ai_dj_usage"
+
+
+def _usage_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(_usage_db_path, timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    # Idempotent — matches lib/db.ts's schema exactly, in case this
+    # subprocess runs before the Node app has ever opened the DB.
+    conn.execute("CREATE TABLE IF NOT EXISTS kv_config (key TEXT PRIMARY KEY, value_json TEXT NOT NULL)")
+    return conn
+
+
+def _save_usage(usage: dict[str, dict]) -> None:
+    conn = _usage_connect()
+    try:
+        conn.execute(
+            "INSERT INTO kv_config (key, value_json) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+            (_USAGE_KEY, json.dumps(usage)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _record_usage(model: str, input_tokens: int, output_tokens: int):
@@ -96,9 +125,8 @@ def _record_usage(model: str, input_tokens: int, output_tokens: int):
         u["output_tokens"] += output_tokens
         u["requests"] += 1
         try:
-            with open(_usage_path, "w", encoding="utf-8") as f:
-                json.dump(usage, f)
-        except OSError:
+            _save_usage(usage)
+        except sqlite3.Error:
             pass  # usage tracking is best-effort — never fail the mix over it
 
 
@@ -112,17 +140,20 @@ def _record_error(model: str, message: str):
         u["errors"] += 1
         u["last_error"] = message[:300]
         try:
-            with open(_usage_path, "w", encoding="utf-8") as f:
-                json.dump(usage, f)
-        except OSError:
+            _save_usage(usage)
+        except sqlite3.Error:
             pass
 
 
 def get_usage() -> dict[str, dict]:
     try:
-        with open(_usage_path, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        conn = _usage_connect()
+        try:
+            row = conn.execute("SELECT value_json FROM kv_config WHERE key = ?", (_USAGE_KEY,)).fetchone()
+        finally:
+            conn.close()
+        return json.loads(row[0]) if row else {}
+    except (sqlite3.Error, FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
