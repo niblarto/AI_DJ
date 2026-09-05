@@ -40,6 +40,16 @@ candidate tracks with BPM, Camelot key, energy, danceability and valence
 candidate under 95 BPM as if its BPM were doubled when judging how it fits
 the request or compares to other tracks' pace - e.g. an 86 BPM track reads
 as ~172 BPM for these purposes, not as a slow track.
+When the request states a sweet spot BPM: favour tracks AT that exact BPM
+(effective BPM, doubled if under 95) first, filling the rest of the set with
+the next-closest BPMs before reaching for anything further away. Treat BPM
+closeness to the sweet spot as the primary selection criterion, ahead of
+energy/mood/danceability - only skip a close-BPM track for a track further
+from the sweet spot when the close one is a genuinely bad fit (wrong effort
+level entirely), not merely a slightly worse mood/energy match. The
+candidate list is already ordered closest-to-sweet-spot first, so picking
+tracks in roughly list order (top to bottom) is the expected default -
+reaching deep into the list while ignoring closer options higher up is wrong.
 Pick tracks that fit the request and order them so effective BPM never
 decreases (using the doubled value for sub-95 BPM tracks) - it's fine, and
 often better, for consecutive tracks to sit at the same or very similar BPM
@@ -47,9 +57,10 @@ rather than always climbing; don't force a spread-out staircase just to make
 BPM rise. Keep keys harmonically compatible where possible (same/adjacent
 Camelot numbers).
 Reply with ONLY a JSON object holding the track NUMBERS in play order, e.g.:
-{"setlist": [17, 4, 62, 31], "reasoning": "one short paragraph"}
-Do not repeat the track details in your reply - numbers only. Use each track
-number at most once. Pick exactly the requested amount."""
+{"setlist": [17, 4, 62, 31]}
+Do not repeat the track details or explain your choices - numbers only, no
+other keys. Use each track number at most once. Pick exactly the requested
+amount."""
 
 _FLOW_SYSTEM = """\
 You are a DJ sequencing a fixed set of tracks for a run - every track listed
@@ -67,9 +78,9 @@ compatible keys where possible (same/adjacent Camelot numbers). The overall
 arc can rise, fall, or stay level - there's no fixed target - just avoid
 abrupt swings between adjacent tracks.
 Reply with ONLY a JSON object holding every track NUMBER in play order, e.g.:
-{"setlist": [17, 4, 62, 31], "reasoning": "one short paragraph"}
-Do not repeat the track details in your reply - numbers only. Every track
-number must appear exactly once."""
+{"setlist": [17, 4, 62, 31]}
+Do not repeat the track details or explain your choices - numbers only, no
+other keys. Every track number must appear exactly once."""
 
 
 def _log(msg: str):
@@ -206,7 +217,7 @@ def _parse_picks(raw: dict, pool: pd.DataFrame) -> list[int]:
 
 def choose_setlist(
     prompt: str, pool: pd.DataFrame, count: int, model: str, unique_artists: bool = False,
-    effort: str | None = None,
+    effort: str | None = None, on_llm=None,
 ) -> tuple[pd.DataFrame, str]:
     """Ask the model to pick and order `count` tracks from the pool."""
     # Cap what's actually shown to the LLM: past ~150-200 candidates, local
@@ -227,13 +238,13 @@ def choose_setlist(
         + f"\nCandidates:\n{_format_pool(visible_pool)}"
     )
     effort_kwargs = {"effort": effort} if effort else {}
-    raw = chat_json(_SETLIST_SYSTEM, user, model=model, temperature=0.4, **effort_kwargs)
+    raw = chat_json(_SETLIST_SYSTEM, user, model=model, temperature=0.4, on_call=on_llm, **effort_kwargs)
     picks = _parse_picks(raw, visible_pool)
 
     if not picks:
         _log("Model reply had no usable tracks; retrying once...")
-        retry = user + '\n\nIMPORTANT: reply as {"setlist": [numbers], "reasoning": "..."} - candidate NUMBERS only.'
-        raw = chat_json(_SETLIST_SYSTEM, retry, model=model, temperature=0.2, **effort_kwargs)
+        retry = user + '\n\nIMPORTANT: reply as {"setlist": [numbers]} - candidate NUMBERS only, no other keys.'
+        raw = chat_json(_SETLIST_SYSTEM, retry, model=model, temperature=0.2, on_call=on_llm, **effort_kwargs)
         picks = _parse_picks(raw, visible_pool)
     if not picks:
         raise ValueError(f"Model returned no usable track picks: {raw}")
@@ -264,7 +275,7 @@ def choose_flow_order(pool: pd.DataFrame, model: str, effort: str | None = None)
 
     if len(picks) < len(visible_pool) * 0.5:
         _log("Flow-order reply covered too few tracks; retrying once...")
-        retry = user + f'\n\nIMPORTANT: reply as {{"setlist": [numbers], "reasoning": "..."}} - ALL {len(visible_pool)} track NUMBERS, each exactly once.'
+        retry = user + f'\n\nIMPORTANT: reply as {{"setlist": [numbers]}} - ALL {len(visible_pool)} track NUMBERS, each exactly once, no other keys.'
         raw = chat_json(_FLOW_SYSTEM, retry, model=model, temperature=0.2, **effort_kwargs)
         picks = _parse_picks(raw, visible_pool)
     if not picks:

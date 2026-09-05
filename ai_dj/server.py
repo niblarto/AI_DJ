@@ -137,7 +137,7 @@ def usage():
     })
 
 
-def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
+def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, int]:
     """Shared /mix and /mix/stream builder — returns (payload, http_status)."""
     segments_text = body.get("segments") or []
     csv_text = body.get("csv") or ""
@@ -198,7 +198,7 @@ def _build_mix_payload(body: dict, progress=None) -> tuple[dict, int]:
             cadence_buckets=buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
             played_tracks=played, play_counts=play_counts, bpm_overrides=bpm_overrides,
             min_total_sec=max_projected_duration(segments_text), avoid_tracks=avoid,
-            effort=effort, progress=progress,
+            effort=effort, progress=progress, on_llm=on_llm,
         )
     except ValueError as e:
         return {"error": str(e)}, 422
@@ -393,6 +393,7 @@ def mix_stream():
                     {"type": "progress", "current": done, "total": total, "segment": label, "detail": detail,
                      "candidateUris": candidate_uris}
                 ),
+                on_llm=(lambda data: q.put({"type": "llm", **data})) if body.get("simulate") else None,
             )
             if status == 200:
                 q.put({"type": "done", **payload})

@@ -169,7 +169,7 @@ def estimate_cost_usd(model: str, usage: dict) -> float:
 
 # ── Ollama backend ────────────────────────────────────────────────────────────
 
-def _chat_json_ollama(system: str, user: str, model: str, temperature: float, timeout: int) -> dict:
+def _chat_json_ollama(system: str, user: str, model: str, temperature: float, timeout: int) -> tuple[dict, str]:
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/chat",
@@ -210,7 +210,7 @@ def _chat_json_ollama(system: str, user: str, model: str, temperature: float, ti
 
     content = resp.json().get("message", {}).get("content", "")
     try:
-        return json.loads(content)
+        return json.loads(content), content
     except json.JSONDecodeError as e:
         raise OllamaError(f"Model returned non-JSON output: {content[:200]!r}") from e
 
@@ -239,7 +239,7 @@ def _get_claude_client():
     return _claude_client
 
 
-def _chat_json_claude(system: str, user: str, model: str, effort: str, timeout: int) -> dict:
+def _chat_json_claude(system: str, user: str, model: str, effort: str, timeout: int) -> tuple[dict, str]:
     client = _get_claude_client()
     try:
         response = client.messages.create(
@@ -268,7 +268,7 @@ def _chat_json_claude(system: str, user: str, model: str, effort: str, timeout: 
 
     text = next((b.text for b in response.content if b.type == "text"), "")
     try:
-        return json.loads(text)
+        return json.loads(text), text
     except json.JSONDecodeError as e:
         raise ClaudeError(f"Claude returned non-JSON output: {text[:200]!r}") from e
 
@@ -297,7 +297,7 @@ def _get_gemini_client():
     return _gemini_client
 
 
-def _chat_json_gemini(system: str, user: str, model: str, timeout: int) -> dict:
+def _chat_json_gemini(system: str, user: str, model: str, timeout: int) -> tuple[dict, str]:
     client = _get_gemini_client()
     try:
         from google.genai import types
@@ -322,7 +322,7 @@ def _chat_json_gemini(system: str, user: str, model: str, timeout: int) -> dict:
     if not text:
         raise GeminiError("Gemini returned an empty response (possibly blocked by safety filters)")
     try:
-        return json.loads(text)
+        return json.loads(text), text
     except json.JSONDecodeError as e:
         raise GeminiError(f"Gemini returned non-JSON output: {text[:200]!r}") from e
 
@@ -377,6 +377,7 @@ def chat_json(
     temperature: float = 0.2,
     timeout: int = 300,
     effort: str = DEFAULT_CLAUDE_EFFORT,
+    on_call=None,
 ) -> dict:
     """Send a chat request and return the parsed JSON reply.
 
@@ -384,6 +385,13 @@ def chat_json(
     to the Claude API using `effort`; a Gemini model ID (see GEMINI_MODELS)
     routes to the Gemini API; anything else is treated as an Ollama model
     tag and uses `temperature`.
+
+    `on_call`, if given, is invoked once with the full (untruncated) exchange
+    — `{"system", "user", "ok", "response"|"error"}` — after the call
+    completes. Separate from the file-based call log above (which truncates
+    to `_PROMPT_LOG_CHARS` and never records the response text), so a caller
+    that wants full prompt/response visibility doesn't need to read that
+    file.
     """
     import datetime
     import time
@@ -397,15 +405,19 @@ def chat_json(
     start = time.monotonic()
     try:
         if is_claude_model(model):
-            result = _chat_json_claude(system, user, model, effort, timeout)
+            result, raw_text = _chat_json_claude(system, user, model, effort, timeout)
         elif is_gemini_model(model):
-            result = _chat_json_gemini(system, user, model, timeout)
+            result, raw_text = _chat_json_gemini(system, user, model, timeout)
         else:
-            result = _chat_json_ollama(system, user, model, temperature, timeout)
+            result, raw_text = _chat_json_ollama(system, user, model, temperature, timeout)
     except Exception as e:
         entry.update(ok=False, error=str(e)[:300], durationMs=int((time.monotonic() - start) * 1000))
         _log_llm_call(entry)
+        if on_call:
+            on_call({"system": system, "user": user, "ok": False, "error": str(e)})
         raise
     entry.update(ok=True, durationMs=int((time.monotonic() - start) * 1000))
     _log_llm_call(entry)
+    if on_call:
+        on_call({"system": system, "user": user, "ok": True, "response": raw_text})
     return result

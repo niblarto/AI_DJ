@@ -105,6 +105,24 @@ def _kind_bpm_bounds(kind: str, overrides: dict | None) -> tuple[float | None, f
             return lo, hi
     return None, None
 
+
+def _kind_bpm_sweet(kind: str, overrides: dict | None) -> float | None:
+    """Preferred BPM within a run type's range, from the Settings-page sweet
+    spot. Unlike _kind_bpm_bounds, this never excludes a track - it only
+    sways which of the still-eligible candidates _segment_pool ranks first.
+    A separate function rather than widening _kind_bpm_bounds to a 3-tuple:
+    both of that function's call sites unpack exactly 2 values, and bounds
+    vs. preference are different enough concepts to keep visibly distinct.
+    None = no preference set for this kind (0-is-falsy is deliberate, same
+    convention as min/max above - a literal 0 BPM isn't meaningful)."""
+    o = (overrides or {}).get(kind)
+    if isinstance(o, dict):
+        try:
+            return float(o["sweet"]) if o.get("sweet") else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
 # Thumbs up/down from the app applies to paces within this window (sec/mi):
 # a downvoted track is excluded from segments near that pace, an upvoted one
 # is pulled to the front of the segment's setlist.
@@ -129,6 +147,21 @@ class Segment:
     duration_sec: float
     pace_sec: float | None  # seconds per mile
     bpm: float | None = None
+    # Preferred BPM within this kind's range (Settings' sweet spot) - a
+    # separate field from `bpm` (the pace-derived cadence target) since the
+    # two mean different things: `bpm` also drives the clamp, the LLM
+    # prompt's "Cadence target" line, the Target BPM output column, and
+    # _bpm_smooth_order's playback arc - none of which this should touch.
+    sweet_bpm: float | None = None
+    # Seconds of a short (<120s) rest folded into duration_sec by the merge
+    # pass below, plus that rest's own pace_sec - purely informational,
+    # unused by BPM matching/track-fill (which correctly just wants a single
+    # time budget). Exists so a distance-from-duration consumer (see
+    # scripts/parse_workout_segments.py) can split the folded rest back out
+    # instead of wrongly converting its time to miles at the work portion's
+    # much faster pace.
+    folded_rest_sec: float = 0.0
+    folded_rest_pace_sec: float | None = None
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
@@ -142,13 +175,21 @@ _REST_RE = re.compile(r"(\d+)\s*(s|sec|secs|min|mins?)\b[^,]*\b(?:rest|walk)", r
 # looking for the real target pace, which (if present at all) always comes
 # from the "at X/mi" part earlier in the line.
 _PACE_CEILING_RE = re.compile(r"\(?\s*(?:no faster than|or slower)\b.*?/mi\)?", re.IGNORECASE)
-# "5 reps of:" / "3 x of:" / "4 sets of:" header introducing a block of
-# lines to repeat N times - the block ends at the next line that isn't part
-# of it (blank, or itself another header/segment at the top level). Runna
-# renders the block's lines with no special indentation of their own, so
-# the only signal is this header line and the segment lines that follow
-# until the next non-continuation line.
-_REPS_RE = re.compile(r"^\s*(\d+)\s*(?:reps?|sets?|x)\s+of\s*:?\s*$", re.IGNORECASE)
+# "5 reps of:" / "3 x of:" / "4 sets of:" / "Repeat the following 3x:"
+# header introducing a block of lines to repeat N times - the block ends at
+# the next line that isn't part of it (blank, or itself another header/
+# segment at the top level). Runna renders the block's lines with no special
+# indentation of their own, so the only signal is this header line and the
+# segment lines that follow until the next non-continuation line.
+_REPS_RE = re.compile(
+    r"^\s*(?:(\d+)\s*(?:reps?|sets?|x)\s+of|repeat\s+the\s+following\s+(\d+)\s*x)\s*:?\s*$",
+    re.IGNORECASE,
+)
+# A multi-line repeat body is fenced by a "----------"-style dashed rule
+# above and below it (Runna's "Repeat the following 3x:" phrasing, as
+# opposed to the older single-line "N reps of:" body) - 3+ dashes, nothing
+# else on the line.
+_DASH_RULE_RE = re.compile(r"^-{3,}$")
 
 
 def _segment_kind(text: str) -> str:
@@ -192,16 +233,23 @@ def _is_segment_line(line: str) -> bool:
 
 
 def _expand_repeat_blocks(lines: list[str]) -> list[str]:
-    """Expand a "5 reps of:" header plus the single compound line that
-    follows it (e.g. "0.62mi at 7:25/mi ..., 90s walking rest") into 5
-    literal copies of that line, so the rest of the parser sees a flat list
-    exactly as if the block had been written out longhand.
+    """Expand a repeat-block header ("5 reps of:" / "Repeat the following
+    3x:") into N literal copies of its body, so the rest of the parser sees
+    a flat list exactly as if the block had been written out longhand.
+
+    Two body shapes are observed from Runna:
+    - A single compound line right after the header (e.g. "0.62mi at
+      7:25/mi ..., 90s walking rest") - the older "N reps/sets/x of:" style.
+    - A "----------"-fenced block of one or more lines after a "Repeat the
+      following Nx:" header (e.g. a work interval followed by its own
+      recovery interval as two separate lines) - each rep repeats the WHOLE
+      fenced group together, not just its first line.
 
     Runna's plain-text export gives no indentation or other structural
     marker for a block's body, so the body can't be told apart from a
     following top-level line (e.g. a cooldown) by line count alone - only
-    the next single non-blank line is treated as the repeated body, which
-    matches every observed Runna repeat block (always one work[+rest] line).
+    the fence (or, without one, the next single non-blank line) marks where
+    the body ends.
     """
     out: list[str] = []
     i = 0
@@ -212,18 +260,48 @@ def _expand_repeat_blocks(lines: list[str]) -> list[str]:
             out.append(lines[i])
             i += 1
             continue
-        count = int(m.group(1))
+        count = int(m.group(1) or m.group(2))
         j = i + 1
         while j < len(lines) and not lines[j].strip():
             j += 1
+
+        if j < len(lines) and _DASH_RULE_RE.match(lines[j].strip()):
+            # Fenced multi-line body: collect every segment line up to the
+            # closing dash rule (or, failing that, the next blank/non-
+            # segment line - a missing closing fence shouldn't swallow the
+            # rest of the workout).
+            k = j + 1
+            body_lines: list[str] = []
+            while k < len(lines):
+                stripped = lines[k].strip()
+                if _DASH_RULE_RE.match(stripped):
+                    k += 1
+                    break
+                if not stripped or not _is_segment_line(stripped):
+                    break
+                body_lines.append(stripped.lstrip("•").strip())
+                k += 1
+            if body_lines:
+                # Every rep's rest is short enough to fold into the work
+                # before it (see the merge pass in parse_workout), so the
+                # chart ends up showing one long flat segment with no visible
+                # sign the reps or rests exist at all - tag the first line of
+                # each rep with "Nx ..." up front so it's clear this block
+                # was picked up and merged, not missed.
+                for rep in range(max(count, 0)):
+                    for idx, body in enumerate(body_lines):
+                        if idx == 0 and count > 1:
+                            out.append(f"{count}x {body}")
+                        else:
+                            out.append(body)
+                i = k
+                continue
+            # Fence with no recognizable segment lines inside it - fall
+            # through to treat the header itself as unmatched below.
+            i = j
+            continue
+
         if j < len(lines) and _is_segment_line(lines[j].strip()):
-            # Every rep's rest is short enough to fold into the work before
-            # it (see the merge pass in parse_workout), so the chart ends up
-            # showing one long flat segment with no visible sign the reps
-            # or rests exist at all - tag the label with "Nx ..." up front so
-            # it's clear this block was picked up and merged, not missed.
-            # Strip any leading bullet first so the prefix leads the line
-            # cleanly instead of landing before/after a stray "•".
             body = lines[j].strip().lstrip("•").strip()
             tagged = f"{count}x {body}" if count > 1 else body
             for _ in range(max(count, 0)):
@@ -300,6 +378,8 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
         if seg.kind == "rest" and seg.duration_sec < 120 and merged:
             merged[-1].duration_sec += seg.duration_sec
             merged[-1].label = f"{merged[-1].label} + {seg.label}"
+            merged[-1].folded_rest_sec += seg.duration_sec
+            merged[-1].folded_rest_pace_sec = seg.pace_sec
         else:
             merged.append(seg)
     return merged
@@ -358,6 +438,7 @@ def _segment_pool(
     easy_bias_sec: float = 0.0, used_artists: set | None = None, played: set | None = None,
     bpm_bounds: tuple[float | None, float | None] = (None, None), avoid: set | None = None,
     play_counts: dict[str, int] | None = None, boosted: set | None = None,
+    sweet_bpm: float | None = None,
 ) -> pd.DataFrame:
     lo, hi = bpm_bounds
     if lo is not None or hi is not None:
@@ -390,7 +471,28 @@ def _segment_pool(
     # penalized for it - only a track slower than target is a real mismatch.
     no_upper_limit = seg.kind == "work"
 
-    for tol, pad in attempts:
+    # Play-count tiers gate which tracks are even eligible, not just how
+    # they're ranked: for a given play-count tier, only tracks with that many
+    # (or fewer) confirmed plays are offered; only once the lowest tier
+    # (0 plays) can't fill the segment's duration budget at ANY BPM/energy
+    # tolerance does the pool expand to the next tier (0-1 plays), then
+    # 0-1-2, and so on up to PLAY_COUNT_WEIGHT_CAP // PLAY_COUNT_WEIGHT plays.
+    # Tier selection is judged purely on the duration budget, never on
+    # min_pool's breadth floor (WIDE_TOLERANCE_KINDS wants up to
+    # MAX_CANDIDATES candidates for LLM variety, which has nothing to do with
+    # how much music the segment's actual runtime needs) - otherwise a short
+    # segment would drag in played tracks solely to hit that breadth target.
+    # Once a tier fills the budget, BPM/energy tolerance keeps widening
+    # *within that same tier* to gather up to min_pool candidates for variety,
+    # but never spills into a higher play-count tier to do so. A thumbs-upped
+    # track is always eligible in the tier-0 pool regardless of its real play
+    # count, so it's never excluded by this gating. play_counts=None (or
+    # empty) skips tiering entirely and behaves as before (BPM/energy
+    # attempts only, judged against min_pool as it always was).
+    max_tier = PLAY_COUNT_WEIGHT_CAP // PLAY_COUNT_WEIGHT
+    play_tiers = list(range(max_tier + 1)) if play_counts else [None]
+
+    def _pool_for(tol, pad, max_plays):
         pool = bpm_filter(library, seg.bpm, tolerance=tol, no_upper_limit=no_upper_limit) if seg.bpm and tol else library
         pool = pool[
             (pool["Energy"] >= max(e_lo - pad, 0))
@@ -399,25 +501,41 @@ def _segment_pool(
         pool = pool[~pool["Track URI"].isin(used)] if "Track URI" in pool.columns else pool
         if used_artists:
             pool = pool[~pool["Artist Name(s)"].map(_primary_artist).isin(used_artists)]
+
+        if max_plays is not None:
+            eligible = pool["Track URI"].map(lambda u: min(play_counts.get(u, 0), max_tier)) <= max_plays
+            if boosted:
+                eligible |= pool["Track URI"].isin(boosted)
+            pool = pool[eligible]
+
         # One track per artist, applied BEFORE the budget check below so the
         # relaxation loop keeps widening until enough unique-artist music
         # exists to fill the whole segment. Keep each artist's closest-to-BPM
         # track so the dedupe costs as little tempo accuracy as possible —
         # with already-played-at-this-pace tracks sorting behind unplayed
         # ones, so an artist's fresh track wins over their played one.
-        if seg.bpm:
-            dist = pool["Tempo"].map(lambda t: _bpm_distance(float(t), seg.bpm))
+        # Sweet spot (Settings) is a ranking preference, not a filter - it
+        # never excludes a track (the bpm_bounds pre-filter above and the
+        # bpm_filter tolerance-tier call above both stay anchored on
+        # seg.bpm, the pace-derived cadence target, unaffected by this).
+        # When set, it substitutes for seg.bpm as the ranking anchor rather
+        # than blending with it, so a track exactly at the sweet spot always
+        # outranks one merely closer to the cadence target - matching "tracks
+        # with this BPM should always be selected first". Falls back to
+        # today's exact behavior (dist anchored on seg.bpm) when unset.
+        anchor = sweet_bpm or seg.bpm
+        if anchor:
+            dist = pool["Tempo"].map(lambda t: _bpm_distance(float(t), anchor))
         else:
             # No tempo target (strength): keep each artist's highest-energy track
             dist = -pool["Energy"].astype(float)
         if play_counts:
-            # Hard tier by play count: weight is the primary sort key, dist
-            # (BPM/energy fit) only breaks ties within the same play count —
-            # see PLAY_COUNT_WEIGHT above. A thumbs-upped track always gets
-            # weight 0 regardless of how many times it's played, so it never
-            # loses a spot in the pool (and therefore the LLM's candidate
-            # list) to its own play count.
-            weight = pool["Track URI"].map(lambda u: min(play_counts.get(u, 0), 10) * PLAY_COUNT_WEIGHT)
+            # Within a play-count tier, dist (BPM/energy fit) still breaks
+            # ties — see PLAY_COUNT_WEIGHT above. A thumbs-upped track
+            # always gets weight 0 regardless of how many times it's
+            # played, so it never loses a spot in the pool (and therefore
+            # the LLM's candidate list) to its own play count.
+            weight = pool["Track URI"].map(lambda u: min(play_counts.get(u, 0), max_tier) * PLAY_COUNT_WEIGHT)
             weight = weight.clip(upper=PLAY_COUNT_WEIGHT_CAP)
             if boosted:
                 weight = weight.where(~pool["Track URI"].isin(boosted), 0)
@@ -436,19 +554,64 @@ def _segment_pool(
         if played:
             is_played = pool["Track URI"].isin(played)
             pool = pd.concat([pool[~is_played], pool[is_played]])
-        # The pool must be able to fill the whole segment — a 2h long run
-        # needs far more than min_pool tracks.
-        if len(pool) >= min_pool and pool["Duration (ms)"].sum() / 1000 >= budget_sec:
-            # Remix: a tight pool can be nothing but the avoided tracks, and
-            # demoting them changes nothing — keep widening until fresh music
-            # alone covers the budget (the tol=None last resort still returns
-            # whatever exists, so genuinely dry pools fall back gracefully).
-            if avoid and tol is not None:
-                fresh_sec = pool.loc[~pool["Track URI"].isin(avoid), "Duration (ms)"].sum() / 1000
-                if fresh_sec < budget_sec:
-                    continue
-            return pool.reset_index(drop=True)
-    return pool.reset_index(drop=True)
+        return pool
+
+    def _fills_budget(pool, tol, max_plays):
+        # Without play-count tiering, preserve the original contract exactly:
+        # a pool isn't accepted until it clears min_pool too, not just the
+        # duration budget.
+        if max_plays is None and len(pool) < min_pool:
+            return False
+        if pool["Duration (ms)"].sum() / 1000 < budget_sec:
+            return False
+        # Remix: a tight pool can be nothing but the avoided tracks, and
+        # demoting them changes nothing — keep widening until fresh music
+        # alone covers the budget (the tol=None last resort still returns
+        # whatever exists, so genuinely dry pools fall back gracefully).
+        if avoid and tol is not None:
+            fresh_sec = pool.loc[~pool["Track URI"].isin(avoid), "Duration (ms)"].sum() / 1000
+            if fresh_sec < budget_sec:
+                return False
+        return True
+
+    last_pool = None
+    for max_plays in play_tiers:
+        tier_fill = None  # (tol, pad) of the loosest attempt that fills the budget in this tier
+        for tol, pad in attempts:
+            pool = _pool_for(tol, pad, max_plays)
+            last_pool = pool
+            if _fills_budget(pool, tol, max_plays):
+                tier_fill = (tol, pad)
+                break
+        if tier_fill is None:
+            # This tier can't fill the segment even at the widest BPM/energy
+            # tolerance — move to the next play-count tier rather than
+            # settling for a short pool.
+            continue
+        # Tier found. Keep widening BPM/energy tolerance *within this same
+        # tier* for breadth (min_pool), but never drop below the fill point
+        # found above and never cross into a higher play-count tier.
+        best = pool
+        for tol, pad in attempts[attempts.index(tier_fill):]:
+            pool = _pool_for(tol, pad, max_plays)
+            if not _fills_budget(pool, tol, max_plays):
+                continue
+            best = pool
+            if len(pool) >= min_pool:
+                break
+        if play_counts:
+            counts = best["Track URI"].map(lambda u: min(play_counts.get(u, 0), max_tier))
+            breakdown = ", ".join(f"{n}x{c}" for c, n in counts.value_counts().sort_index().items())
+            _log(
+                f"'{seg.label}': pool settled at play-count tier <= {max_plays} "
+                f"({len(best)} tracks, {breakdown})"
+            )
+        return best.reset_index(drop=True)
+
+    # No play-count tier filled the budget at any tolerance — fall back to
+    # the loosest attempt's raw pool (matches the pre-tiering behavior for a
+    # genuinely dry library).
+    return (last_pool if last_pool is not None else library).reset_index(drop=True)
 
 
 def _chain_order(pool: pd.DataFrame, anchor: pd.DataFrame | None) -> list[int]:
@@ -466,6 +629,17 @@ def _chain_order(pool: pd.DataFrame, anchor: pd.DataFrame | None) -> list[int]:
         remaining.remove(nxt)
         order.append(nxt)
     return order
+
+
+def _bpm_smooth_order(chosen: pd.DataFrame, target_bpm: float | None) -> pd.DataFrame:
+    """Reorders a segment's already-selected tracks slowest to fastest by
+    effective BPM, so playback steadily climbs across the segment with the
+    smallest possible jump between every consecutive pair. No-op for
+    target_bpm=None (strength segments have no tempo target)."""
+    if len(chosen) <= 1 or target_bpm is None:
+        return chosen
+    eff = chosen["Tempo"].map(lambda t: _effective_run_tempo(float(t)))
+    return chosen.loc[eff.sort_values(kind="stable").index]
 
 
 def _fit_duration(ordered: pd.DataFrame, budget_sec: float, overshoot: bool = False) -> pd.DataFrame:
@@ -501,6 +675,7 @@ def build_workout_playlist(
     avoid_tracks: list[str] | None = None,
     effort: str | None = None,
     progress=None,
+    on_llm=None,
 ) -> pd.DataFrame:
     """Fill every segment with BPM-matched tracks; returns rows with a
     Segment label and cumulative timing columns.
@@ -539,6 +714,10 @@ def build_workout_playlist(
 
     easy_bias_sec = min(max(easy_bias_sec, 0.0), 30.0)
     for seg in segments:
+        # Outside the pace_sec guard below (unlike the clamp) so it's set
+        # uniformly - naturally None for strength since bpm_overrides never
+        # has a "strength" key from the Settings side.
+        seg.sweet_bpm = _kind_bpm_sweet(seg.kind, bpm_overrides)
         if seg.pace_sec:
             pace = seg.pace_sec
             if seg.kind in CHILL_KINDS:
@@ -617,10 +796,26 @@ def build_workout_playlist(
         avoid = set(avoid_tracks or [])
         played = _played_uris(seg.pace_sec) | avoid
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
+        # _segment_pool's tolerance-widening loop stops the INSTANT it clears
+        # min_pool, even if far more close-BPM tracks exist just one tier
+        # out — with the old flat min_pool=20, a large library easily has
+        # 20+ tracks within the tightest (3 BPM) tolerance, so the loop
+        # returned right there and never considered the rest. For the
+        # "wide tolerance" kinds (easy/cooldown/rest/warmup — WIDE_TOLERANCE_
+        # KINDS above), pull the floor up to MAX_CANDIDATES itself so the
+        # search keeps widening until either it's seen every reasonably
+        # close track or run out of headroom, giving the LLM (and the
+        # deterministic fallback) the full available choice to sequence a
+        # tight, smoothly-transitioning segment from — not just the bare
+        # minimum needed to fill the time budget. "work" stays at 20: pace
+        # accuracy matters more than candidate breadth there, and its
+        # tolerance is already the tight, non-widening default.
+        seg_min_pool = MAX_CANDIDATES if seg.kind in WIDE_TOLERANCE_KINDS else 20
         pool = _segment_pool(
-            lib_for_seg, seg, used, min_pool=20, budget_sec=budget, easy_bias_sec=easy_bias_sec,
+            lib_for_seg, seg, used, min_pool=seg_min_pool, budget_sec=budget, easy_bias_sec=easy_bias_sec,
             used_artists=used_artists, played=played, play_counts=play_counts, boosted=boosted or None,
             bpm_bounds=_kind_bpm_bounds(seg.kind, bpm_overrides), avoid=avoid or None,
+            sweet_bpm=seg.sweet_bpm,
         )
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
@@ -628,13 +823,30 @@ def build_workout_playlist(
 
         median_sec = pool["Duration (ms)"].median() / 1000
         n_est = min(math.ceil(budget / median_sec) + 1, len(pool))
+        # The LLM sees the whole settled-tier pool (every 0-play track that
+        # passed BPM/energy filtering, or the next tier up only if 0-play
+        # tracks alone can't fill the segment - see _segment_pool), not just
+        # enough to hit n_est: capping the candidate list tighter than that
+        # once made it just as easy for the model to reach for a played track
+        # a few rows down as an unplayed one, since a small list gives it too
+        # little room to express a BPM/mood preference without leaving the
+        # 0-play tier. choose_setlist still hard-caps at MAX_CANDIDATES on
+        # its own for model-quality reasons (see its docstring).
+        llm_pool = pool
 
         ordered = None
         if use_llm:
             cadence_line = f"Cadence target {seg.bpm:.0f} steps/min. " if seg.bpm else ""
+            sweet_line = (
+                f"Sweet spot BPM {seg.sweet_bpm:.0f} - strongly prefer tracks at or very near this "
+                "BPM (candidates are listed closest-to-sweet-spot first; favour tracks near the top "
+                "of the list over ones further down) unless another factor makes a close-BPM track a "
+                "clearly worse fit. "
+                if seg.sweet_bpm else ""
+            )
             prompt = (
                 f"Section of a run workout: {seg.label}. "
-                f"{cadence_line}"
+                f"{cadence_line}{sweet_line}"
                 + {
                     "warmup": "Easing in - upbeat but not full throttle.",
                     "work": "Hard effort - driving, motivating, relentless. Faster than the cadence target is fine, even better - only slower tracks are a mismatch here.",
@@ -645,23 +857,36 @@ def build_workout_playlist(
                 }[seg.kind]
             )
             target_bpm_str = f"{seg.bpm:.0f}" if seg.bpm else "none"
-            # choose_setlist only ever shows the model the first MAX_CANDIDATES
-            # rows of the pool (closest-BPM first) - report that capped count
-            # as what's "sent", plus the full pool size when it's bigger, so
-            # the progress line doesn't overstate how many the LLM actually sees.
-            sent_count = min(len(pool), MAX_CANDIDATES)
+            # llm_pool (capped to candidate_cap above) is what's actually
+            # sent - report that count, plus the full pool size when it's
+            # bigger, so the progress line doesn't overstate how many the LLM
+            # actually sees.
+            sent_count = len(llm_pool)
             pool_desc = f"{sent_count} candidates" if sent_count == len(pool) else f"{sent_count} of {len(pool)} candidates"
+            sweet_str = f", sweet {seg.sweet_bpm:.0f}" if seg.sweet_bpm else ""
+            # Play-count breakdown of what's actually sent to the LLM (not
+            # the wider `pool`) - "0x9, 1x4" reads as 9 never-played tracks
+            # and 4 one-play tracks made the candidate list, so a mix that
+            # still picks played tracks can be told apart from one that had
+            # no fresher choice to offer.
+            plays_str = ""
+            if play_counts:
+                sent_counts = llm_pool["Track URI"].map(lambda u: play_counts.get(u, 0))
+                plays_str = ", plays " + ", ".join(f"{c}x{n}" for c, n in sent_counts.value_counts().sort_index().items())
             _log(
                 f"'{seg.label}': sending {pool_desc} to {model} "
-                f"(target {target_bpm_str} BPM, pool range "
-                f"{pool['Tempo'].min():.0f}-{pool['Tempo'].max():.0f} BPM, count target {n_est})"
+                f"(target {target_bpm_str} BPM{sweet_str}, pool range "
+                f"{pool['Tempo'].min():.0f}-{pool['Tempo'].max():.0f} BPM, count target {n_est}{plays_str})"
             )
-            candidate_uris = pool["Track URI"].head(MAX_CANDIDATES).tolist() if "Track URI" in pool.columns else None
+            candidate_uris = llm_pool["Track URI"].tolist() if "Track URI" in llm_pool.columns else None
             _progress(seg_idx, seg.label, f"Sending {pool_desc} to {model}…", candidate_uris)
             try:
-                ordered, _ = choose_setlist(prompt, pool, n_est, model, effort=effort)
+                ordered, _ = choose_setlist(prompt, llm_pool, n_est, model, effort=effort, on_llm=on_llm)
                 picked_bpm = ordered["Tempo"].tolist() if not ordered.empty else []
-                _log(f"'{seg.label}': {model} returned {len(ordered)} tracks, BPMs: {picked_bpm}")
+                picked_plays_str = ""
+                if play_counts and not ordered.empty:
+                    picked_plays_str = f", plays: {ordered['Track URI'].map(lambda u: play_counts.get(u, 0)).tolist()}"
+                _log(f"'{seg.label}': {model} returned {len(ordered)} tracks, BPMs: {picked_bpm}{picked_plays_str}")
                 _progress(seg_idx, seg.label, f"{model} returned {len(ordered)} tracks")
             except Exception as e:
                 _log(f"LLM selection failed for '{seg.label}' ({e}); using distance chain.")
@@ -704,15 +929,17 @@ def build_workout_playlist(
         ordered = ordered[~ordered["Artist Name(s)"].map(_primary_artist).duplicated()]
 
         chosen = _fit_duration(ordered, budget, overshoot=is_last).copy()
-        # Playback order within the segment: slowest effective BPM first,
-        # building up to the fastest (sub-95 BPM tracks sort by their doubled
-        # tempo, same convention as BPM matching elsewhere) — track
-        # *selection* above (LLM picks, played/boosted demotion, artist
-        # dedup, budget fit) is untouched; this only resorts the segment's
-        # already-chosen tracks before they're written out.
-        if len(chosen) > 1:
-            eff_tempo = chosen["Tempo"].map(lambda t: _effective_run_tempo(float(t)))
-            chosen = chosen.loc[eff_tempo.sort_values(kind="stable").index]
+        # Playback order within the segment: track *selection* above (LLM
+        # picks / deterministic fallback, played/boosted demotion, artist
+        # dedup, budget fit) is untouched — this only resequences the
+        # already-chosen set into a greedy nearest-effective-BPM chain, so
+        # every consecutive pair's BPM jump is as small as the available
+        # tracks allow (opens on whichever track sits closest to the
+        # segment's target). Replaces an earlier version that force-sorted
+        # every segment slowest-to-fastest regardless of what was selected
+        # (produced an artificial rising staircase) — this instead minimizes
+        # jumps in whichever direction, without imposing a fixed direction.
+        chosen = _bpm_smooth_order(chosen, seg.bpm)
         chosen["Segment"] = seg.label
         chosen["Target BPM"] = seg.bpm
         chosen["Target Pace"] = seg.pace_sec  # sec/mi, for post-run pace review
