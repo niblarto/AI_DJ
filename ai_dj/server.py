@@ -137,6 +137,64 @@ def usage():
     })
 
 
+@app.get("/models")
+def models():
+    """Installed Ollama models on this host, for the Running app's Settings
+    -> LLM Testing tab (which needs to build a multi-model dropdown from
+    wherever Ollama actually lives, since it isn't the Pi this app runs on)."""
+    try:
+        import requests as rq
+
+        from .llm import OLLAMA_URL
+
+        resp = rq.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        return jsonify({
+            "models": [
+                {"name": m["name"], "sizeBytes": m.get("size")}
+                for m in data.get("models", [])
+                # nomic-embed-text and similar embedding-only models report
+                # "embedding" as their only capability (no "completion") and
+                # can't answer a chat prompt at all - exclude them from the
+                # comparison picker.
+                if "completion" in (m.get("capabilities") or ["completion"])
+            ],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "models": []}), 200
+
+
+@app.get("/model-status")
+def model_status():
+    """Which model (if any) is currently loaded in Ollama and its GPU/CPU
+    split, for the LLM Testing tab to show offload live while a comparison
+    runs - same data `ollama ps` reports, via Ollama's own HTTP API so this
+    doesn't need to spawn a subprocess for something table-stakes-cheap."""
+    try:
+        import requests as rq
+
+        from .llm import OLLAMA_URL
+
+        resp = rq.get(f"{OLLAMA_URL}/api/ps", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        out = []
+        for m in data.get("models", []):
+            size = m.get("size") or 0
+            size_vram = m.get("size_vram") or 0
+            gpu_pct = round((size_vram / size) * 100) if size else 0
+            out.append({
+                "name": m["name"],
+                "sizeBytes": size,
+                "gpuPercent": gpu_pct,
+                "cpuPercent": 100 - gpu_pct,
+            })
+        return jsonify({"models": out})
+    except Exception as e:
+        return jsonify({"error": str(e), "models": []}), 200
+
+
 def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, int]:
     """Shared /mix and /mix/stream builder — returns (payload, http_status)."""
     segments_text = body.get("segments") or []
