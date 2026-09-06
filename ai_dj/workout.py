@@ -857,12 +857,17 @@ def build_workout_playlist(
                 }[seg.kind]
             )
             target_bpm_str = f"{seg.bpm:.0f}" if seg.bpm else "none"
-            # llm_pool (capped to candidate_cap above) is what's actually
-            # sent - report that count, plus the full pool size when it's
-            # bigger, so the progress line doesn't overstate how many the LLM
-            # actually sees.
-            sent_count = len(llm_pool)
-            pool_desc = f"{sent_count} candidates" if sent_count == len(pool) else f"{sent_count} of {len(pool)} candidates"
+            # choose_setlist truncates its own view of the pool to
+            # MAX_CANDIDATES (see its docstring - past ~150-200 candidates
+            # local models start losing track of the numeric BPM data and
+            # quality collapses) regardless of how large llm_pool is, so
+            # mirror that same slice here for the log/progress line - this
+            # used to just report len(llm_pool), which claimed the full
+            # (potentially 300+) pool was "sent" when choose_setlist had
+            # already silently capped what the model actually saw.
+            visible_pool = llm_pool.head(MAX_CANDIDATES) if len(llm_pool) > MAX_CANDIDATES else llm_pool
+            sent_count = len(visible_pool)
+            pool_desc = f"{sent_count} of {len(llm_pool)} candidates" if sent_count < len(llm_pool) else f"{sent_count} candidates"
             sweet_str = f", sweet {seg.sweet_bpm:.0f}" if seg.sweet_bpm else ""
             # Play-count breakdown of what's actually sent to the LLM (not
             # the wider `pool`) - "0x9, 1x4" reads as 9 never-played tracks
@@ -871,14 +876,14 @@ def build_workout_playlist(
             # no fresher choice to offer.
             plays_str = ""
             if play_counts:
-                sent_counts = llm_pool["Track URI"].map(lambda u: play_counts.get(u, 0))
+                sent_counts = visible_pool["Track URI"].map(lambda u: play_counts.get(u, 0))
                 plays_str = ", plays " + ", ".join(f"{c}x{n}" for c, n in sent_counts.value_counts().sort_index().items())
             _log(
                 f"'{seg.label}': sending {pool_desc} to {model} "
                 f"(target {target_bpm_str} BPM{sweet_str}, pool range "
                 f"{pool['Tempo'].min():.0f}-{pool['Tempo'].max():.0f} BPM, count target {n_est}{plays_str})"
             )
-            candidate_uris = llm_pool["Track URI"].tolist() if "Track URI" in llm_pool.columns else None
+            candidate_uris = visible_pool["Track URI"].tolist() if "Track URI" in visible_pool.columns else None
             _progress(seg_idx, seg.label, f"Sending {pool_desc} to {model}…", candidate_uris)
             try:
                 ordered, _ = choose_setlist(prompt, llm_pool, n_est, model, effort=effort, on_llm=on_llm)
