@@ -152,7 +152,7 @@ def models():
         data = resp.json()
         return jsonify({
             "models": [
-                {"name": m["name"], "sizeBytes": m.get("size")}
+                {"name": m["name"], "sizeBytes": m.get("size"), "capabilities": m.get("capabilities") or ["completion"]}
                 for m in data.get("models", [])
                 # nomic-embed-text and similar embedding-only models report
                 # "embedding" as their only capability (no "completion") and
@@ -193,6 +193,65 @@ def model_status():
         return jsonify({"models": out})
     except Exception as e:
         return jsonify({"error": str(e), "models": []}), 200
+
+
+_PACE_PRO_VISION_SYSTEM = """\
+You extract Garmin PacePro split tables from screenshots into CSV.
+The image is a table with columns: Splits, Split Distance, Split Pace,
+Cumulative Distance, Cumulative Avg Pace, Elevation Change. Use ONLY the
+Splits, Split Distance, and Split Pace columns - ignore Cumulative Distance,
+Cumulative Avg Pace, and Elevation Change entirely.
+Reply with ONLY a JSON object: {"csv": "Splits,Split Distance,Split Pace\\n1,1.72mi,8:17/mi\\n2,..."}
+One row per split, in table order, numbered from 1. Distances as e.g.
+"1.72mi" (no space), paces as e.g. "8:17/mi" (no space). No other keys, no
+explanation, no markdown formatting in the csv string beyond the newlines
+shown."""
+
+
+@app.post("/vision-transcribe")
+def vision_transcribe():
+    """Transcribes a PacePro split-table screenshot into the same CSV shape
+    pace-pro.csv uses, via whichever Ollama model the request names (the
+    caller - Settings -> Pace Pro - checks that model's "vision" capability
+    via GET /models before ever calling this, so a non-vision model here is
+    a caller bug, not something this route needs to re-validate)."""
+    body = request.get_json(silent=True) or {}
+    image_b64 = body.get("imageBase64")
+    model = body.get("model") or app.config["MODEL"]
+    if not image_b64:
+        return jsonify({"error": "imageBase64 required"}), 400
+
+    try:
+        import requests as rq
+
+        from .llm import OLLAMA_URL
+
+        resp = rq.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _PACE_PRO_VISION_SYSTEM},
+                    {"role": "user", "content": "Extract the split table from this image.", "images": [image_b64]},
+                ],
+                "stream": False,
+                "format": "json",
+                "think": False,
+                "options": {"temperature": 0.1, "num_ctx": 9728, "num_predict": 2048},
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        content = resp.json().get("message", {}).get("content", "")
+        parsed = json.loads(content)
+        csv_text = parsed.get("csv")
+        if not csv_text or not isinstance(csv_text, str):
+            return jsonify({"error": "Model reply had no usable csv field"}), 502
+        return jsonify({"csv": csv_text})
+    except json.JSONDecodeError:
+        return jsonify({"error": "Model reply was not valid JSON"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, int]:
@@ -250,6 +309,10 @@ def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, in
     effort = (body.get("effort") or DEFAULT_CLAUDE_EFFORT) if is_claude_model(model) else None
 
     use_llm = app.config["USE_LLM"] and body.get("useLlm", True)
+    strict_pace_tolerance = bool(body.get("strictPaceTolerance"))
+    segment_candidate_uris = body.get("segmentCandidateUris")
+    if not isinstance(segment_candidate_uris, list):
+        segment_candidate_uris = None
     try:
         playlist = build_workout_playlist(
             segments, library, model=model, use_llm=use_llm,
@@ -257,6 +320,8 @@ def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, in
             played_tracks=played, play_counts=play_counts, bpm_overrides=bpm_overrides,
             min_total_sec=max_projected_duration(segments_text), avoid_tracks=avoid,
             effort=effort, progress=progress, on_llm=on_llm,
+            strict_pace_tolerance=strict_pace_tolerance,
+            segment_candidate_uris=segment_candidate_uris,
         )
     except ValueError as e:
         return {"error": str(e)}, 422

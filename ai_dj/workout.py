@@ -676,6 +676,8 @@ def build_workout_playlist(
     effort: str | None = None,
     progress=None,
     on_llm=None,
+    strict_pace_tolerance: bool = False,
+    segment_candidate_uris: list[list[str] | None] | None = None,
 ) -> pd.DataFrame:
     """Fill every segment with BPM-matched tracks; returns rows with a
     Segment label and cumulative timing columns.
@@ -706,6 +708,30 @@ def build_workout_playlist(
     progress: optional callable(done, total, segment_label) invoked as each
     segment starts building — lets callers stream a live progress bar (the
     per-segment LLM call is the slow part).
+
+    strict_pace_tolerance: hard-excludes any candidate whose effective BPM
+    falls more than BPM_TOLERANCES[0] (the tightest, "work"-segment band)
+    below each segment's own cadence-derived target — no upper limit above
+    target, matching lib/pace-analysis.ts's classifyPaceFit() exactly, so a
+    track this rule accepts is one Pace Analysis would also call "fits" for
+    that segment's pace. Overrides bpm_overrides' per-kind bounds entirely
+    (not just tightens them) for every segment, not only "work" ones —
+    intended for Pace Pro mixes, where every split is itself a pace target
+    and there's no warmup/easy/cooldown structure to treat more loosely.
+    Segments with no pace (seg.bpm is None, e.g. strength) are unaffected.
+
+    segment_candidate_uris: one entry per segment (same order/length as
+    `segments`; None or a missing trailing entry means "no restriction" for
+    that segment). When given, that segment's pool is hard-restricted to
+    ONLY those URIs, on top of (not instead of) every other filter (energy,
+    play-count tiering, artist dedup, downvotes, etc.) — this is stronger
+    than strict_pace_tolerance, which still lets the BPM-tolerance-widening
+    loop range over the whole library; this caps the library itself before
+    that loop ever runs. Intended for Pace Pro's "use Pace Analysis's own
+    fit list as the candidates" mode: the caller has already computed
+    exactly which confirmed-play tracks fit this segment's pace (see
+    lib/pace-analysis.ts) and wants the LLM to choose only from those, not
+    from every library track that happens to match the BPM window.
     """
     # Tracks without a duration can't be time-budgeted — NaN would poison the
     # cumulative sums ("cannot convert float NaN to integer"). Drop them.
@@ -725,11 +751,16 @@ def build_workout_playlist(
             seg.bpm = pace_to_bpm(pace, cadence_buckets)
             # Clamp the target into the run type's bounds so BPM matching
             # aims inside the window instead of fighting the hard filter.
-            lo, hi = _kind_bpm_bounds(seg.kind, bpm_overrides)
-            if seg.bpm and hi is not None:
-                seg.bpm = min(seg.bpm, hi)
-            if seg.bpm and lo is not None:
-                seg.bpm = max(seg.bpm, lo)
+            # Skipped under strict_pace_tolerance: that mode bypasses the
+            # kind-based bounds system entirely (see its call site below),
+            # so clamping seg.bpm into them here first would still leak
+            # through and diverge from Pace Analysis's raw cadence target.
+            if not strict_pace_tolerance:
+                lo, hi = _kind_bpm_bounds(seg.kind, bpm_overrides)
+                if seg.bpm and hi is not None:
+                    seg.bpm = min(seg.bpm, hi)
+                if seg.bpm and lo is not None:
+                    seg.bpm = max(seg.bpm, lo)
 
     # Cover the workout's slowest projected duration rather than appending
     # arbitrary padding tracks: stretch the final segment's budget only by
@@ -811,12 +842,41 @@ def build_workout_playlist(
         # accuracy matters more than candidate breadth there, and its
         # tolerance is already the tight, non-widening default.
         seg_min_pool = MAX_CANDIDATES if seg.kind in WIDE_TOLERANCE_KINDS else 20
-        pool = _segment_pool(
-            lib_for_seg, seg, used, min_pool=seg_min_pool, budget_sec=budget, easy_bias_sec=easy_bias_sec,
-            used_artists=used_artists, played=played, play_counts=play_counts, boosted=boosted or None,
-            bpm_bounds=_kind_bpm_bounds(seg.kind, bpm_overrides), avoid=avoid or None,
-            sweet_bpm=seg.sweet_bpm,
-        )
+        if strict_pace_tolerance and seg.bpm:
+            # Hard floor at target - tightest tolerance, no ceiling - same
+            # rule lib/pace-analysis.ts's classifyPaceFit() judges "fits"
+            # by. Replaces (not tightens) the kind-based bpm_overrides bounds.
+            seg_bpm_bounds = (seg.bpm - BPM_TOLERANCES[0], None)
+        else:
+            seg_bpm_bounds = _kind_bpm_bounds(seg.kind, bpm_overrides)
+
+        seg_allowed_uris = segment_candidate_uris[seg_idx] if segment_candidate_uris and seg_idx < len(segment_candidate_uris) else None
+        pool = pd.DataFrame()
+        if seg_allowed_uris is not None:
+            # Preferred pool: restricted to exactly the caller-supplied URIs
+            # (Pace Pro: whatever lib/pace-analysis.ts already classified as
+            # "fits" this segment's pace from confirmed play history) - tried
+            # first so the LLM only ever sees music already proven to work at
+            # this pace. Only falls through to the full library below if this
+            # can't fill the segment's own time budget on its own.
+            restricted_lib = lib_for_seg[lib_for_seg["Track URI"].isin(set(seg_allowed_uris))]
+            candidate_pool = _segment_pool(
+                restricted_lib, seg, used, min_pool=seg_min_pool, budget_sec=budget, easy_bias_sec=easy_bias_sec,
+                used_artists=used_artists, played=played, play_counts=play_counts, boosted=boosted or None,
+                bpm_bounds=seg_bpm_bounds, avoid=avoid or None,
+                sweet_bpm=seg.sweet_bpm,
+            )
+            if not candidate_pool.empty and candidate_pool["Duration (ms)"].sum() / 1000 >= budget:
+                pool = candidate_pool
+            elif not candidate_pool.empty:
+                _log(f"'{seg.label}': restricted candidate list too small for the segment budget, widening to the full library")
+        if pool.empty:
+            pool = _segment_pool(
+                lib_for_seg, seg, used, min_pool=seg_min_pool, budget_sec=budget, easy_bias_sec=easy_bias_sec,
+                used_artists=used_artists, played=played, play_counts=play_counts, boosted=boosted or None,
+                bpm_bounds=seg_bpm_bounds, avoid=avoid or None,
+                sweet_bpm=seg.sweet_bpm,
+            )
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue
