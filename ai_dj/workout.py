@@ -660,6 +660,107 @@ def _fit_duration(ordered: pd.DataFrame, budget_sec: float, overshoot: bool = Fa
     return ordered.loc[picked]
 
 
+# A workout segment this short (or shorter) gets exactly one track, picked
+# for closeness to the budget alone — there's no room to search combinations
+# at this scale, and a single well-matched track reads more naturally than a
+# multi-track search forcing an exact sum out of a 2-3 minute window.
+SHORT_SEGMENT_SEC = 180.0
+# Bounded search effort for a >SHORT_SEGMENT_SEC segment — kept small since
+# ordered can run to MAX_CANDIDATES (150) tracks and this runs once per
+# workout segment; a full subset-sum search isn't worth it when this gets
+# within a few seconds of exact almost every time in practice.
+_FIT_DROP_ATTEMPTS = 6  # how many of the greedy prefix's own tracks to try dropping, one at a time
+_FIT_SWAP_LOOKAHEAD = 6  # how many tracks past the greedy cut to try swapping in for the crossing track
+
+
+def _fit_duration_precise(ordered: pd.DataFrame, budget_sec: float, overshoot: bool = False) -> pd.DataFrame:
+    """Like _fit_duration, but searches nearby combinations of `ordered`
+    (never reordering by preference — only choosing a different SUBSET of
+    the same ranked pool) for whichever gets closest to budget_sec, instead
+    of accepting whatever the first greedy pass lands on. Used for workout
+    segments, where the AI DJ mix's own track boundaries are meant to line
+    up with the workout's planned segment changes as closely as possible;
+    the plain greedy _fit_duration remains what flow mixes (no segment
+    structure to line up against) use.
+
+    budget_sec <= SHORT_SEGMENT_SEC: picks the single closest-duration track
+    from `ordered` instead of searching sums — see SHORT_SEGMENT_SEC.
+
+    Search strategy for a longer segment: start from the greedy prefix
+    (same rule _fit_duration uses — the crossing track only kept when
+    overshoot beats stopping short), then try two families of nearby
+    alternatives that stay close to the pool's own preference order: (a)
+    swap the crossing track for one of the next few tracks in rank order,
+    which may fit tighter, and (b) drop one already-picked track (starting
+    from the lowest-ranked of the picked set) and see if the resulting
+    shortfall is better filled by the next unpicked track. Keeps whichever
+    candidate combination lands closest to budget_sec; ties keep the
+    earliest (highest-ranked) combination found."""
+    if ordered.empty:
+        return ordered
+
+    if budget_sec <= SHORT_SEGMENT_SEC:
+        durations = ordered["Duration (ms)"] / 1000
+        best_idx = (durations - budget_sec).abs().idxmin()
+        return ordered.loc[[best_idx]]
+
+    durations = (ordered["Duration (ms)"] / 1000).tolist()
+    order_idx = list(ordered.index)
+    n = len(order_idx)
+
+    def total(picked_positions: list[int]) -> float:
+        return sum(durations[p] for p in picked_positions)
+
+    # Greedy prefix, as positions into order_idx (not labels) so dropping/
+    # swapping by position is straightforward.
+    greedy: list[int] = []
+    cum = 0.0
+    crossing_pos: int | None = None
+    for pos in range(n):
+        dur = durations[pos]
+        if cum + dur >= budget_sec:
+            crossing_pos = pos
+            if overshoot or not greedy or (cum + dur - budget_sec) < (budget_sec - cum):
+                greedy.append(pos)
+            break
+        greedy.append(pos)
+        cum += dur
+
+    candidates: list[list[int]] = [greedy]
+
+    # (a) Swap the crossing track for one of the next few candidates in rank
+    # order — a later, shorter/longer track might close the gap tighter than
+    # whatever happened to be next in the ranking.
+    if not overshoot and crossing_pos is not None:
+        base = [p for p in greedy if p != crossing_pos]
+        base_total = total(base)
+        for lookahead_pos in range(crossing_pos + 1, min(crossing_pos + 1 + _FIT_SWAP_LOOKAHEAD, n)):
+            candidates.append(base + [lookahead_pos])
+
+    # (b) Drop one already-picked track (lowest-ranked first, since that's
+    # the least preferred to lose) and try filling the resulting shortfall
+    # with the next unpicked track instead.
+    if not overshoot:
+        picked_set = set(greedy)
+        unpicked = [p for p in range(n) if p not in picked_set]
+        for drop_pos in reversed(greedy[-_FIT_DROP_ATTEMPTS:]):
+            reduced = [p for p in greedy if p != drop_pos]
+            reduced_total = total(reduced)
+            if reduced_total >= budget_sec:
+                candidates.append(reduced)
+                continue
+            for fill_pos in unpicked[:_FIT_SWAP_LOOKAHEAD]:
+                if fill_pos in reduced:
+                    continue
+                candidates.append(reduced + [fill_pos])
+
+    def miss(picked_positions: list[int]) -> float:
+        return abs(total(picked_positions) - budget_sec)
+
+    best = min(candidates, key=miss)
+    return ordered.iloc[sorted(best)]
+
+
 def build_workout_playlist(
     segments: list[Segment],
     library: pd.DataFrame,
@@ -993,7 +1094,7 @@ def build_workout_playlist(
         # tracks by one artist — keep only the first of each.
         ordered = ordered[~ordered["Artist Name(s)"].map(_primary_artist).duplicated()]
 
-        chosen = _fit_duration(ordered, budget, overshoot=is_last).copy()
+        chosen = _fit_duration_precise(ordered, budget, overshoot=is_last).copy()
         # Playback order within the segment: track *selection* above (LLM
         # picks / deterministic fallback, played/boosted demotion, artist
         # dedup, budget fit) is untouched — this only resequences the
