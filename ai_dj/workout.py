@@ -162,11 +162,28 @@ class Segment:
     # much faster pace.
     folded_rest_sec: float = 0.0
     folded_rest_pace_sec: float | None = None
+    # True for a segment built from an explicit "Nmin at Xbpm" line (the
+    # Running app's AI Remix) rather than a pace — `bpm` is the user's own
+    # literal target, so build_workout_playlist must never apply the
+    # Settings sweet-spot preference or run-type bounds on top of it (both
+    # are pace-derived-target concepts; a directly-typed BPM has nothing to
+    # be swayed or clamped toward).
+    literal_bpm: bool = False
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 
 _PACE_RE = re.compile(r"(\d+):(\d+)\s*/mi")
+# Literal-BPM segment ("595s at 173bpm") — the Running app's Dashboard
+# chart's multi-select "AI Remix…" writes this instead of a pace, when the
+# user picked a target BPM directly rather than a run pace. Distinct from
+# _PACE_RE (which always means sec/mi) so a normal Runna workout line can
+# never accidentally match this.
+_BPM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*bpm\b", re.IGNORECASE)
+# Whole-seconds duration for a literal-BPM segment only — "Nmin" (used by
+# every other segment kind) can't express the sub-minute precision this
+# app's ±15s budget tolerance needs.
+_SEG_SEC_RE = re.compile(r"(\d+)\s*s\b", re.IGNORECASE)
 _DIST_RE = re.compile(r"([\d.]+)\s*mi\b")
 _REST_RE = re.compile(r"(\d+)\s*(s|sec|secs|min|mins?)\b[^,]*\b(?:rest|walk)", re.IGNORECASE)
 # A "no faster than X/mi" (or "or slower") clause is a ceiling on an
@@ -223,6 +240,7 @@ def _is_segment_line(line: str) -> bool:
     t = stripped.lower()
     return bool(
         _PACE_RE.search(stripped)
+        or _BPM_RE.search(stripped)
         or _REST_RE.search(stripped)
         or " at " in t
         or "warm up" in t or "warmup" in t
@@ -267,9 +285,20 @@ def _expand_repeat_blocks(lines: list[str]) -> list[str]:
 
         if j < len(lines) and _DASH_RULE_RE.match(lines[j].strip()):
             # Fenced multi-line body: collect every segment line up to the
-            # closing dash rule (or, failing that, the next blank/non-
-            # segment line - a missing closing fence shouldn't swallow the
-            # rest of the workout).
+            # closing dash rule (or, failing that, the next non-blank,
+            # non-segment line - a missing closing fence shouldn't swallow
+            # the rest of the workout). A BLANK line inside the fence is
+            # just Runna's normal line spacing between body lines (every
+            # real export has one between "0.10mi at 7:05/mi" and "0.50mi
+            # at a comfortable pace") and must be skipped, not treated as
+            # the end of the body - treating it as a terminator (an earlier
+            # version of this) meant a fenced body of more than one line
+            # only ever collected its FIRST line before hitting the blank
+            # separator and bailing, so the "Nx" repeat never actually
+            # multiplied anything: the whole directive silently fell
+            # through as if it were a single one-off pair, exactly matching
+            # a live report of a "3x 0.10mi + 0.50mi" interval block
+            # rendering as just one un-repeated instance of each.
             k = j + 1
             body_lines: list[str] = []
             while k < len(lines):
@@ -277,7 +306,10 @@ def _expand_repeat_blocks(lines: list[str]) -> list[str]:
                 if _DASH_RULE_RE.match(stripped):
                     k += 1
                     break
-                if not stripped or not _is_segment_line(stripped):
+                if not stripped:
+                    k += 1
+                    continue
+                if not _is_segment_line(stripped):
                     break
                 body_lines.append(stripped.lstrip("•").strip())
                 k += 1
@@ -322,6 +354,27 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
 
         rest_m = _REST_RE.search(line)
         run_part = line[: rest_m.start()].rstrip(", ") if rest_m else line
+
+        bpm_m = _BPM_RE.search(run_part)
+        if bpm_m:
+            # Literal-BPM segment: no pace at all, so build_workout_playlist's
+            # `if seg.pace_sec:` guard leaves seg.bpm exactly as set here —
+            # no pace_to_bpm conversion, no kind-based clamping. Duration is
+            # an explicit whole-seconds count ("595s at 173bpm") — the
+            # Running app's AI Remix writes this, never "Nmin": this app's
+            # standard ±15s budget tolerance needs second-level precision, and
+            # rounding to the nearest whole MINUTE (an earlier version of
+            # this) could throw the target off by up to 30s before the fit
+            # search even started (confirmed live: a 9:55 selection sent as
+            # "10min" hunted for combinations that summed to 600s, not 595s).
+            dur_m = _SEG_SEC_RE.search(run_part)
+            duration = int(dur_m.group(1)) if dur_m else 0
+            if duration > 0:
+                # "work": the tight, symmetric BPM_TOLERANCES band — a
+                # literal target BPM is exactly the "hard effort, pace
+                # really counts" case that tolerance band exists for.
+                segments.append(Segment(run_part, "work", duration, None, bpm=float(bpm_m.group(1)), literal_bpm=True))
+            continue
 
         ceiling_m = _PACE_CEILING_RE.search(run_part)
         pace_run_part = _PACE_CEILING_RE.sub("", run_part)
@@ -382,7 +435,40 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
             merged[-1].folded_rest_pace_sec = seg.pace_sec
         else:
             merged.append(seg)
-    return merged
+
+    # A "work" segment shorter than VERY_SHORT_SEGMENT_SEC (e.g. a 0.10mi
+    # sprint rep, ~40s) can't be covered start-to-finish by any real track —
+    # nothing runs that short. Whatever track gets picked at the work BPM
+    # necessarily plays on past the segment boundary regardless (see
+    # _fit_duration_precise's own top-of-pool pick for a segment this
+    # short), so giving the very next recovery-type segment (easy/cooldown/
+    # rest) its OWN separate, slower-BPM track pick right at that boundary
+    # produces an abrupt, unnatural cut mere seconds into the work track —
+    # confirmed live: a real "3x 0.10mi @ 7:05/mi, 0.50mi comfortable"
+    # interval still got two distinctly separate tracks per rep, one per
+    # segment, because the work segment's overshoot (a couple minutes at
+    # most) rarely eats the WHOLE following recovery segment's own budget,
+    # so build_workout_playlist's normal carry-shrinks-the-next-budget
+    # mechanism alone doesn't cover this case. Folding the recovery
+    # segment's time directly into the short work segment here — BEFORE
+    # any track-fill runs — means the whole combined window is built as
+    # one segment at the work segment's own (harder) target the same way
+    # a folded short rest already is, so there's simply no separate,
+    # slower-BPM segment left to trigger a second track pick at all.
+    fully_merged: list[Segment] = []
+    i = 0
+    while i < len(merged):
+        seg = merged[i]
+        if seg.kind == "work" and seg.duration_sec < VERY_SHORT_SEGMENT_SEC and i + 1 < len(merged) and merged[i + 1].kind in ("easy", "cooldown", "rest"):
+            nxt = merged[i + 1]
+            seg.duration_sec += nxt.duration_sec
+            seg.label = f"{seg.label} + {nxt.label}"
+            fully_merged.append(seg)
+            i += 2
+            continue
+        fully_merged.append(seg)
+        i += 1
+    return fully_merged
 
 
 # ── Pace -> BPM ──────────────────────────────────────────────────────────────
@@ -665,6 +751,21 @@ def _fit_duration(ordered: pd.DataFrame, budget_sec: float, overshoot: bool = Fa
 # at this scale, and a single well-matched track reads more naturally than a
 # multi-track search forcing an exact sum out of a 2-3 minute window.
 SHORT_SEGMENT_SEC = 180.0
+# A segment shorter than THIS gets its track picked by POOL PREFERENCE
+# (ordered's own top-ranked BPM/energy/play-count fit) instead of by
+# closeness to the tiny budget — closest-duration actively picks the
+# SHORTEST available track for a window this small (confirmed live: a
+# 0.10mi @ ~42s work interval got a track picked to fit ~42s, cutting off
+# right where the following recovery segment started a whole new,
+# separately-picked track — jarring, and defeating the point of a hard
+# interval this brief in the first place, since no track can cleanly start
+# AND finish inside a 42s window anyway). A real song naturally runs
+# several minutes; letting it run long and carry (build_workout_playlist's
+# `carry` bookkeeping) into the following recovery segment — shrinking or
+# skipping that segment's own budget once carry eats into it — means the
+# fast track's own BPM keeps playing through the recovery instead of an
+# abrupt cut to a new, slower track mere seconds in.
+VERY_SHORT_SEGMENT_SEC = 150.0
 # Bounded search effort for a >SHORT_SEGMENT_SEC segment — kept small since
 # ordered can run to MAX_CANDIDATES (150) tracks and this runs once per
 # workout segment; a full subset-sum search isn't worth it when this gets
@@ -698,6 +799,13 @@ def _fit_duration_precise(ordered: pd.DataFrame, budget_sec: float, overshoot: b
     earliest (highest-ranked) combination found."""
     if ordered.empty:
         return ordered
+
+    if budget_sec <= VERY_SHORT_SEGMENT_SEC:
+        # Take the pool's own top pick (already ranked by BPM/energy/play-
+        # count fit — see _segment_pool) and let it run its natural length,
+        # rather than hunting for whichever track happens to be closest to
+        # this tiny budget — see VERY_SHORT_SEGMENT_SEC's own comment.
+        return ordered.iloc[[0]]
 
     if budget_sec <= SHORT_SEGMENT_SEC:
         durations = ordered["Duration (ms)"] / 1000
@@ -843,8 +951,9 @@ def build_workout_playlist(
     for seg in segments:
         # Outside the pace_sec guard below (unlike the clamp) so it's set
         # uniformly - naturally None for strength since bpm_overrides never
-        # has a "strength" key from the Settings side.
-        seg.sweet_bpm = _kind_bpm_sweet(seg.kind, bpm_overrides)
+        # has a "strength" key from the Settings side. Skipped for a literal
+        # BPM segment - see Segment.literal_bpm's own doc comment.
+        seg.sweet_bpm = None if seg.literal_bpm else _kind_bpm_sweet(seg.kind, bpm_overrides)
         if seg.pace_sec:
             pace = seg.pace_sec
             if seg.kind in CHILL_KINDS:
@@ -866,12 +975,20 @@ def build_workout_playlist(
     # Cover the workout's slowest projected duration rather than appending
     # arbitrary padding tracks: stretch the final segment's budget only by
     # whatever the segment targets fall short of it. Without a projection,
-    # fall back to the old fixed pad.
+    # fall back to the old fixed pad. Never applied when the final segment
+    # is a literal-BPM one (AI Remix) - that segment's whole point is to
+    # fit EXACTLY the given budget, not "don't run out of music" slack
+    # (confirmed live: a 595s AI Remix request came back as a 895s fill -
+    # PLAYLIST_PAD_SEC's unconditional +300s was being added on top of the
+    # exact budget the caller asked for, same class of bug the is_last
+    # override above already fixed for the fit-search's overshoot mode -
+    # this is the OTHER place "final segment" assumptions leaked in).
     total = sum(s.duration_sec for s in segments)
-    if min_total_sec and min_total_sec > total:
-        segments[-1].duration_sec += min_total_sec - total
-    elif not min_total_sec:
-        segments[-1].duration_sec += PLAYLIST_PAD_SEC
+    if not segments[-1].literal_bpm:
+        if min_total_sec and min_total_sec > total:
+            segments[-1].duration_sec += min_total_sec - total
+        elif not min_total_sec:
+            segments[-1].duration_sec += PLAYLIST_PAD_SEC
 
     parts: list[pd.DataFrame] = []
     used: set = set()
@@ -915,7 +1032,17 @@ def build_workout_playlist(
     llm_failures: list[str] = []
     for seg_idx, seg in enumerate(segments):
         _progress(seg_idx, seg.label)
-        is_last = seg is segments[-1]
+        # A literal-BPM segment (AI Remix) is never "the last segment of a
+        # real run that must not go silent" — it's a fixed-length swap-in for
+        # exactly the tracks it's replacing, so it always wants the tight
+        # swap/drop search below, never the greedy-overshoot-only behavior
+        # `overshoot=True` gives every workout's genuinely final segment
+        # (confirmed live: a 595s AI Remix selection came back 16:58 long —
+        # _fit_duration_precise's greedy prefix crossed the budget on its
+        # 3rd track and, with overshoot always true, kept it unconditionally
+        # instead of ever checking whether stopping at 2 tracks, or swapping
+        # the 3rd for a shorter one, would land closer).
+        is_last = seg is segments[-1] and not seg.literal_bpm
         budget = seg.duration_sec - carry
         # Previous overshoot already covers this segment (but the final
         # segment's budget is a hard minimum — only skip it when fully covered).
@@ -978,6 +1105,25 @@ def build_workout_playlist(
                 bpm_bounds=seg_bpm_bounds, avoid=avoid or None,
                 sweet_bpm=seg.sweet_bpm,
             )
+        if seg.literal_bpm and seg.bpm and not pool.empty:
+            # AI Remix asks for tracks AT this BPM, not merely close to it —
+            # BPM_TOLERANCES above (±3-8) is the right width for a workout
+            # segment's pace-derived cadence target (some slack is fine, the
+            # LLM leans toward the top-ranked/closest anyway), but a
+            # literal, directly-typed target reads as a precise ask. Narrow
+            # the pool to only tracks whose RAW tempo, doubled, or halved
+            # rounds to exactly seg.bpm — same symmetric half/double-time-
+            # aware rule replace-candidates-budget/route.ts's isExactBpm
+            # uses for the deterministic Remix…, so AI Remix and Remix…
+            # promise the same precision.
+            target_rounded = round(seg.bpm)
+            exact = pool["Tempo"].map(
+                lambda t: target_rounded in (round(float(t)), round(float(t) * 2), round(float(t) / 2))
+            )
+            if exact.any():
+                pool = pool[exact]
+            else:
+                _log(f"'{seg.label}': no track rounds to exactly {seg.bpm:.0f} BPM — falling back to the tolerance-widened pool")
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue

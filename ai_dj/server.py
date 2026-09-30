@@ -254,6 +254,69 @@ def vision_transcribe():
         return jsonify({"error": str(e)}), 502
 
 
+_RACE_SPLITS_VISION_SYSTEM = """\
+You extract a race pacing split table from a screenshot into tab-separated
+text. The image is a table with 6 columns, in this order: split number,
+split distance, split pace, cumulative distance, cumulative average pace,
+elevation change. Extract ALL SIX columns for every row - unlike a plain
+PacePro table, every column here matters.
+Reply with ONLY a JSON object: {"text": "1\\t1.72 mi\\t7:57 /mi\\t1.72 mi\\t7:57 /mi\\t- 2 m\\n2\\t..."}
+One row per split, in table order, numbered from 1, fields separated by a
+literal tab character (\\t) within each row and a newline (\\n) between
+rows. Distances as e.g. "1.72 mi", paces as e.g. "7:57 /mi", elevation as
+e.g. "- 2 m" or "+ 54 m" (sign, space, number, space, m). No other keys, no
+explanation, no markdown formatting in the text string beyond the
+tabs/newlines shown."""
+
+
+@app.post("/vision-transcribe-race-splits")
+def vision_transcribe_race_splits():
+    """Transcribes a full 6-column race-pacing split-table screenshot (split
+    #, split distance, split pace, cumulative distance, cumulative avg pace,
+    elevation change) into the tab-separated text lib/race-splits.ts's
+    parsePastedSplits already parses - the Runna schedule card's race
+    workouts use this (elevation/cumulative included), distinct from
+    /vision-transcribe which deliberately drops those columns for the
+    simpler Pace Pro page use case."""
+    body = request.get_json(silent=True) or {}
+    image_b64 = body.get("imageBase64")
+    model = body.get("model") or app.config["MODEL"]
+    if not image_b64:
+        return jsonify({"error": "imageBase64 required"}), 400
+
+    try:
+        import requests as rq
+
+        from .llm import OLLAMA_URL
+
+        resp = rq.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _RACE_SPLITS_VISION_SYSTEM},
+                    {"role": "user", "content": "Extract the split table from this image.", "images": [image_b64]},
+                ],
+                "stream": False,
+                "format": "json",
+                "think": False,
+                "options": {"temperature": 0.1, "num_ctx": 9728, "num_predict": 2048},
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        content = resp.json().get("message", {}).get("content", "")
+        parsed = json.loads(content)
+        text = parsed.get("text")
+        if not text or not isinstance(text, str):
+            return jsonify({"error": "Model reply had no usable text field"}), 502
+        return jsonify({"text": text})
+    except json.JSONDecodeError:
+        return jsonify({"error": "Model reply was not valid JSON"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, int]:
     """Shared /mix and /mix/stream builder — returns (payload, http_status)."""
     segments_text = body.get("segments") or []
