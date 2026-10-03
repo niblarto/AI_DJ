@@ -1110,12 +1110,17 @@ def build_workout_playlist(
             # BPM_TOLERANCES above (±3-8) is the right width for a workout
             # segment's pace-derived cadence target (some slack is fine, the
             # LLM leans toward the top-ranked/closest anyway), but a
-            # literal, directly-typed target reads as a precise ask. Narrow
-            # the pool to only tracks whose RAW tempo, doubled, or halved
-            # rounds to exactly seg.bpm — same symmetric half/double-time-
-            # aware rule replace-candidates-budget/route.ts's isExactBpm
-            # uses for the deterministic Remix…, so AI Remix and Remix…
-            # promise the same precision.
+            # literal, directly-typed target reads as a precise, non-
+            # negotiable ask. Narrow the pool to only tracks whose RAW tempo,
+            # doubled, or halved rounds to exactly seg.bpm — same symmetric
+            # half/double-time-aware rule replace-candidates-budget/route.ts's
+            # isExactBpm uses for the deterministic Remix…, so AI Remix and
+            # Remix… promise the same precision. Deliberately NO fallback to
+            # a tolerance-widened pool when nothing matches exactly — a
+            # near-miss (e.g. 170 when 168 was asked for) silently returned
+            # instead of the segment just coming back empty defeats the
+            # entire point of a literal BPM ask; the segment is skipped
+            # instead (same as genuinely having no candidates at all).
             target_rounded = round(seg.bpm)
             exact = pool["Tempo"].map(
                 lambda t: target_rounded in (round(float(t)), round(float(t) * 2), round(float(t) / 2))
@@ -1123,7 +1128,8 @@ def build_workout_playlist(
             if exact.any():
                 pool = pool[exact]
             else:
-                _log(f"'{seg.label}': no track rounds to exactly {seg.bpm:.0f} BPM — falling back to the tolerance-widened pool")
+                _log(f"'{seg.label}': no track rounds to exactly {seg.bpm:.0f} BPM — segment will be empty")
+                pool = pool.iloc[0:0]
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue
