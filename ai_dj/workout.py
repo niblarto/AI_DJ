@@ -1075,6 +1075,19 @@ def build_workout_playlist(
             # rule lib/pace-analysis.ts's classifyPaceFit() judges "fits"
             # by. Replaces (not tightens) the kind-based bpm_overrides bounds.
             seg_bpm_bounds = (seg.bpm - BPM_TOLERANCES[0], None)
+        elif seg.literal_bpm:
+            # A literal, directly-typed BPM (AI Remix) has nothing to do
+            # with the "work" kind's general Settings range (e.g. a
+            # configured 170-180 "work" window) - that range is for
+            # pace-derived cadence targets, not a specific number the user
+            # just typed in. Clamping to it here was silently excluding
+            # real matching tracks before the exact-BPM filter below ever
+            # got to see them (confirmed: 55 real 168 BPM library tracks,
+            # all excluded because "work" was configured for a different
+            # range), making a perfectly satisfiable request come back
+            # empty. No kind-based bounds at all - the exact-match filter
+            # below is the only constraint that should apply.
+            seg_bpm_bounds = (None, None)
         else:
             seg_bpm_bounds = _kind_bpm_bounds(seg.kind, bpm_overrides)
 
@@ -1112,15 +1125,18 @@ def build_workout_playlist(
             # LLM leans toward the top-ranked/closest anyway), but a
             # literal, directly-typed target reads as a precise, non-
             # negotiable ask. Narrow the pool to only tracks whose RAW tempo,
-            # doubled, or halved rounds to exactly seg.bpm — same symmetric
-            # half/double-time-aware rule replace-candidates-budget/route.ts's
-            # isExactBpm uses for the deterministic Remix…, so AI Remix and
-            # Remix… promise the same precision. Deliberately NO fallback to
-            # a tolerance-widened pool when nothing matches exactly — a
-            # near-miss (e.g. 170 when 168 was asked for) silently returned
-            # instead of the segment just coming back empty defeats the
-            # entire point of a literal BPM ask; the segment is skipped
-            # instead (same as genuinely having no candidates at all).
+            # doubled, or halved rounds to exactly seg.bpm — a half/double-
+            # time track genuinely plays at the target cadence once halved/
+            # doubled, so it's a real match, not just a close one (NOT the
+            # same rule as replace-candidates-budget/route.ts's isExactBpm,
+            # which is plain round(tempo)==round(target) with no half/double-
+            # time symmetry — a prior version of this comment wrongly claimed
+            # they matched). Deliberately NO fallback to a tolerance-widened
+            # pool when nothing matches exactly — a near-miss (e.g. 170 when
+            # 168 was asked for) silently returned instead of the segment
+            # just coming back empty defeats the entire point of a literal
+            # BPM ask; the segment is skipped instead (same as genuinely
+            # having no candidates at all).
             target_rounded = round(seg.bpm)
             exact = pool["Tempo"].map(
                 lambda t: target_rounded in (round(float(t)), round(float(t) * 2), round(float(t) / 2))
