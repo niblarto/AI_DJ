@@ -29,11 +29,16 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Gemini models selectable from Settings — Flash tier only: gemini-2.5-pro
 # has no free-tier access, and these two cover fast/cheap vs a bit more
 # capable while staying on the free tier.
+# Gemini 2.5 was withdrawn for new API users (404 "no longer available"), so
+# the 3.x Flash models are offered; the 2.5 IDs stay listed so older saved
+# settings still route to Gemini.
 GEMINI_MODELS = {
-    "gemini-2.5-flash": "Flash 2.5",
-    "gemini-2.5-flash-lite": "Flash 2.5 Lite",
+    "gemini-3.8-flash": "Flash 3.8",
+    "gemini-3.5-flash-lite": "Flash 3.5 Lite",
+    "gemini-2.5-flash": "Flash 2.5 (retired)",
+    "gemini-2.5-flash-lite": "Flash 2.5 Lite (retired)",
 }
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 
 # Rough $/1M token pricing for the session cost estimate shown in Settings —
 # not billing-accurate (no cache discount applied), just a ballpark. Gemini
@@ -421,3 +426,204 @@ def chat_json(
     if on_call:
         on_call({"system": system, "user": user, "ok": True, "response": raw_text})
     return result
+
+
+# ── Plain-text multi-turn chat (PaceSync Coach) ───────────────────────────────
+# The mixer only ever needs one-shot JSON replies (chat_json above); the
+# Coach page needs a running conversation answered in prose. Same three
+# backends, same API keys and usage counters, same call log.
+#
+# messages: [{"role": "user"|"assistant", "content": str}, ...] — oldest
+# first, ending with the user's newest message.
+
+COACH_NUM_CTX = 16384
+
+
+def _chat_text_ollama(system: str, messages: list[dict], model: str, temperature: float, timeout: int, think: bool = False) -> str:
+    try:
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": model,
+                "messages": [{"role": "system", "content": system}, *messages],
+                "stream": False,
+                # Thinking on for coach reports (slower, but careful with
+                # numbers and comparisons); off for chat replies.
+                "think": think,
+                # Training context + a conversation runs well past the 4096
+                # default. The coach prompt is the only thing loaded at the
+                # time, so a bigger window than the mixer's 9728 fits.
+                # Thinking tokens count towards num_predict, hence the bigger cap.
+                "options": {"temperature": temperature, "num_ctx": COACH_NUM_CTX, "num_predict": 8192 if think else 2048},
+            },
+            timeout=timeout,
+        )
+    except requests.ConnectionError as e:
+        raise OllamaError(f"Cannot reach Ollama at {OLLAMA_URL} - is it running?") from e
+    if resp.status_code == 404:
+        raise OllamaError(f"Model '{model}' not found - run: ollama pull {model}")
+    resp.raise_for_status()
+    text = (resp.json().get("message", {}).get("content") or "").strip()
+    if not text:
+        raise OllamaError("Model returned an empty reply")
+    return text
+
+
+def _chat_text_claude(system: str, messages: list[dict], model: str, effort: str, timeout: int) -> str:
+    client = _get_claude_client()
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=system,
+            messages=messages,
+            output_config={"effort": effort},
+            timeout=timeout,
+        )
+    except Exception as e:
+        _record_error(model, str(e))
+        raise ClaudeError(f"Claude API request failed: {e}") from e
+    _record_usage(model, response.usage.input_tokens, response.usage.output_tokens)
+    if response.stop_reason == "refusal":
+        _record_error(model, "safety refusal")
+        raise ClaudeError("Claude declined the request (safety refusal)")
+    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    if not text:
+        raise ClaudeError("Claude returned an empty reply")
+    return text
+
+
+def _chat_text_gemini(system: str, messages: list[dict], model: str, timeout: int) -> str:
+    client = _get_gemini_client()
+    try:
+        from google.genai import types
+        contents = [
+            types.Content(role="model" if m["role"] == "assistant" else "user", parts=[types.Part(text=m["content"])])
+            for m in messages
+        ]
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                http_options=types.HttpOptions(timeout=timeout * 1000),
+            ),
+        )
+    except Exception as e:
+        _record_error(model, str(e))
+        raise GeminiError(f"Gemini API request failed: {e}") from e
+    usage = response.usage_metadata
+    if usage is not None:
+        _record_usage(model, usage.prompt_token_count or 0, usage.candidates_token_count or 0)
+    text = (response.text or "").strip()
+    if not text:
+        raise GeminiError("Gemini returned an empty reply (possibly blocked by safety filters)")
+    return text
+
+
+def chat_text_gemini_web(system: str, messages: list[dict], model: str, timeout: int = 240) -> dict:
+    """One Gemini reply with Google Search grounding, for the Coach's web
+    search button. Returns {"reply": str, "sources": [{"title", "url"}]}."""
+    client = _get_gemini_client()
+    try:
+        from google.genai import types
+        contents = [
+            types.Content(role="model" if m["role"] == "assistant" else "user", parts=[types.Part(text=m["content"])])
+            for m in messages
+        ]
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                http_options=types.HttpOptions(timeout=timeout * 1000),
+            ),
+        )
+    except Exception as e:
+        _record_error(model, str(e))
+        raise GeminiError(f"Gemini API request failed: {e}") from e
+    usage = response.usage_metadata
+    if usage is not None:
+        _record_usage(model, usage.prompt_token_count or 0, usage.candidates_token_count or 0)
+    text = (response.text or "").strip()
+    if not text:
+        raise GeminiError("Gemini returned an empty reply (possibly blocked by safety filters)")
+    sources: list[dict] = []
+    seen: set[str] = set()
+    try:
+        meta = response.candidates[0].grounding_metadata
+        for chunk in (meta.grounding_chunks or []) if meta else []:
+            web = getattr(chunk, "web", None)
+            if web and web.uri and web.uri not in seen:
+                seen.add(web.uri)
+                sources.append({"title": web.title or web.uri, "url": web.uri})
+    except Exception:
+        pass
+    return {"reply": text, "sources": sources}
+
+
+def chat_text(
+    system: str,
+    messages: list[dict],
+    model: str = DEFAULT_MODEL,
+    temperature: float = 0.6,
+    timeout: int = 300,
+    effort: str = DEFAULT_CLAUDE_EFFORT,
+    think: bool = False,
+) -> str:
+    """Multi-turn chat returning the assistant's prose reply. `model` picks
+    the backend exactly as chat_json does. `think` turns on the local model's
+    reasoning (Ollama only)."""
+    import datetime
+    import time
+
+    last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    entry = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "model": model,
+        "kind": "coach",
+        "system": system[:_PROMPT_LOG_CHARS] + ("…" if len(system) > _PROMPT_LOG_CHARS else ""),
+        "prompt": "[Coach] " + last_user[:_PROMPT_LOG_CHARS],
+    }
+    start = time.monotonic()
+    try:
+        if is_claude_model(model):
+            text = _chat_text_claude(system, messages, model, effort, timeout)
+        elif is_gemini_model(model):
+            text = _chat_text_gemini(system, messages, model, timeout)
+        else:
+            text = _chat_text_ollama(system, messages, model, temperature, timeout, think)
+    except Exception as e:
+        entry.update(ok=False, error=str(e)[:300], durationMs=int((time.monotonic() - start) * 1000))
+        _log_llm_call(entry)
+        raise
+    entry.update(ok=True, durationMs=int((time.monotonic() - start) * 1000))
+    _log_llm_call(entry)
+    return text
+
+
+# ── Embeddings (PaceSync Coach memory) ────────────────────────────────────────
+# bge-large (the model ai-running-coach used) through Ollama on this PC.
+# Ollama puts it on the GPU when there's room next to the chat model and
+# falls back to CPU by itself when there isn't.
+
+COACH_EMBED_MODEL = os.environ.get("COACH_EMBED_MODEL", "bge-large")
+
+
+def embed_texts(texts: list[str], model: str = COACH_EMBED_MODEL, timeout: int = 60) -> list[list[float]]:
+    try:
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/embed",
+            json={"model": model, "input": texts, "truncate": True},
+            timeout=timeout,
+        )
+    except requests.ConnectionError as e:
+        raise OllamaError(f"Cannot reach Ollama at {OLLAMA_URL} - is it running?") from e
+    if resp.status_code == 404:
+        raise OllamaError(f"Model '{model}' not found - run: ollama pull {model}")
+    resp.raise_for_status()
+    vectors = resp.json().get("embeddings") or []
+    if len(vectors) != len(texts):
+        raise OllamaError(f"Expected {len(texts)} embeddings, got {len(vectors)}")
+    return vectors

@@ -341,6 +341,28 @@ def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, in
         except (TypeError, ValueError):
             buckets = None
 
+    # Kind-aware cadence ("easy" vs "work" profiles) computed server-side by
+    # lib/ai-dj-mix.ts's loadKindCadenceBuckets — this host (often a
+    # different machine, e.g. a Windows PC) can't read the Next.js app's own
+    # pacesync.db or GarminDB files directly, so it's sent over the wire the
+    # same way the plain unfiltered `buckets` above already is. Without
+    # this, every mix built via this remote-service path (config.provider
+    # == "local"/Ollama) silently used the OLD unfiltered cadence lookup
+    # even after ai_dj.workout.garmin_cadence_buckets_by_kind was fixed —
+    # that fix lives in the on-Pi bridge's own call path, which this server
+    # process never goes through.
+    kind_buckets = None
+    raw_kind_buckets = body.get("kindCadenceBuckets")
+    if isinstance(raw_kind_buckets, dict):
+        try:
+            kind_buckets = {
+                kind: {int(b): float(spm) for b, spm in bucket_map.items()}
+                for kind, bucket_map in raw_kind_buckets.items()
+                if isinstance(bucket_map, dict)
+            } or None
+        except (TypeError, ValueError):
+            kind_buckets = None
+
     try:
         easy_bias = float(body.get("easyBias") or 0.0)
     except (TypeError, ValueError):
@@ -379,7 +401,7 @@ def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, in
     try:
         playlist = build_workout_playlist(
             segments, library, model=model, use_llm=use_llm,
-            cadence_buckets=buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
+            cadence_buckets=buckets, kind_cadence_buckets=kind_buckets, easy_bias_sec=easy_bias, track_feedback=feedback,
             played_tracks=played, play_counts=play_counts, bpm_overrides=bpm_overrides,
             min_total_sec=max_projected_duration(segments_text), avoid_tracks=avoid,
             effort=effort, progress=progress, on_llm=on_llm,
@@ -611,6 +633,41 @@ def mix_stream():
         mimetype="text/event-stream",
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/coach/chat")
+def coach_chat():
+    """PaceSync Coach on the local model: {"system", "messages": [{role,
+    content}], "model"?, "think"?} -> {"reply"}. "think" turns on the model's
+    reasoning (used for reports). Claude/Gemini coach chats run on the Pi
+    instead (scripts/coach_bridge.py), like the mixer."""
+    from .llm import chat_text
+
+    body = request.get_json(force=True) or {}
+    messages = [m for m in (body.get("messages") or []) if m.get("role") in ("user", "assistant") and m.get("content")]
+    if not messages:
+        return jsonify({"error": "No messages"}), 400
+    model = body.get("model") or app.config["MODEL"]
+    try:
+        think = bool(body.get("think"))
+        reply = chat_text(body.get("system") or "", messages, model=model, timeout=900 if think else 300, think=think)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"reply": reply, "model": model})
+
+
+@app.post("/coach/embed")
+def coach_embed():
+    """Coach memory embeddings: {"texts": [str]} -> {"model", "vectors"}."""
+    from .llm import COACH_EMBED_MODEL, embed_texts
+
+    texts = [str(t) for t in (request.get_json(force=True) or {}).get("texts") or [] if str(t).strip()]
+    if not texts:
+        return jsonify({"error": "No texts"}), 400
+    try:
+        return jsonify({"model": COACH_EMBED_MODEL, "vectors": embed_texts(texts)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 def main():

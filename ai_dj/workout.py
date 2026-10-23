@@ -106,6 +106,70 @@ def _kind_bpm_bounds(kind: str, overrides: dict | None) -> tuple[float | None, f
     return None, None
 
 
+# Widest a strict-BPM step-out search will try before giving up and
+# returning the library unfiltered (which then likely leaves the segment
+# empty downstream, same as "no candidates at all" always has) - generous
+# enough to find literally any populated BPM in a real library without
+# risking a runaway loop on a pathological one.
+_STRICT_BPM_MAX_STEP = 40
+
+def _exact_bpm_pool(
+    library: pd.DataFrame, target_bpm: float, bpm_bounds: tuple[float | None, float | None] = (None, None),
+) -> pd.DataFrame:
+    """Every mix segment with a BPM target now gets EXACTLY one whole-number
+    BPM for its entire candidate pool, not a tolerance band — restricts
+    `library` to tracks whose raw tempo, doubled, or halved rounds to
+    target_bpm (round-to-nearest), same half/double-time symmetry the
+    literal-BPM/AI-Remix filter already used (a half/double-time track
+    genuinely plays at the target cadence once halved/doubled, so it's a
+    real match, not just a close one). If nothing rounds to the exact
+    target, steps outward by whole BPM (target+1, target-1, target+2,
+    target-2, ...) until a populated BPM is found - every segment still
+    gets music, but always from a single exact BPM value, never a widened
+    band. Returns the (possibly empty, if the whole step-out range was dry)
+    filtered library; the caller logs which BPM actually got used when it
+    differs from the original target.
+
+    bpm_bounds (a kind's Settings min/max, compared against _effective_run_
+    tempo same as the hard filter _segment_pool applies on top of this)
+    narrows which stepped-out BPM values are even considered a candidate -
+    without this, the step-out search could lock onto a populated BPM that
+    _segment_pool's OWN bpm_bounds filter then immediately wipes back out
+    again downstream, silently emptying the segment even though a real,
+    in-range match existed just one or two steps further out.
+    """
+    target_rounded = round(target_bpm)
+    lo, hi = bpm_bounds
+
+    def _in_bounds(bpm: int) -> bool:
+        eff = _effective_run_tempo(float(bpm))
+        if lo is not None and eff < lo:
+            return False
+        if hi is not None and eff > hi:
+            return False
+        return True
+
+    def _at(bpm: int) -> pd.DataFrame:
+        match = library["Tempo"].map(
+            lambda t: bpm in (round(float(t)), round(float(t) * 2), round(float(t) / 2))
+        )
+        return library[match]
+
+    if _in_bounds(target_rounded):
+        pool = _at(target_rounded)
+        if not pool.empty:
+            return pool
+    for step in range(1, _STRICT_BPM_MAX_STEP + 1):
+        for bpm in (target_rounded + step, target_rounded - step):
+            if not _in_bounds(bpm):
+                continue
+            pool = _at(bpm)
+            if not pool.empty:
+                _log(f"No in-range tracks at exactly {target_rounded} BPM — widened to {bpm} BPM instead")
+                return pool
+    return library.iloc[0:0]
+
+
 def _kind_bpm_sweet(kind: str, overrides: dict | None) -> float | None:
     """Preferred BPM within a run type's range, from the Settings-page sweet
     spot. Unlike _kind_bpm_bounds, this never excludes a track - it only
@@ -147,6 +211,23 @@ class Segment:
     duration_sec: float
     pace_sec: float | None  # seconds per mile
     bpm: float | None = None
+    # The pace-derived cadence target BEFORE _kind_bpm_bounds' Settings
+    # ceiling/floor clamp (build_workout_playlist sets both `bpm` and this
+    # together - see its own comment). `bpm` stays the CLAMPED value for
+    # everything it always drove (the LLM prompt's "Cadence target" line,
+    # the Target BPM output column, _bpm_smooth_order's playback arc, and
+    # _segment_pool's bpm_bounds/ranking anchor) - this field exists solely
+    # for the strict exact-BPM pool lock (_exact_bpm_pool), which must use
+    # the REAL pace target rather than the clamp: a segment whose pace
+    # genuinely calls for 185 BPM but gets clamped to a 170 "work" ceiling
+    # otherwise locks onto exactly 170, same as every OTHER segment the
+    # clamp also caps at 170 - flattening every fast segment onto one
+    # identical BPM instead of each locking to its own real cadence (the
+    # Settings ceiling/floor still applies as a hard boundary via
+    # bpm_bounds, same as before - it just no longer collapses the LOCK
+    # target itself). None whenever `bpm` is (strength, or clamping never
+    # ran e.g. strict_pace_tolerance/literal_bpm).
+    raw_bpm: float | None = None
     # Preferred BPM within this kind's range (Settings' sweet spot) - a
     # separate field from `bpm` (the pace-derived cadence target) since the
     # two mean different things: `bpm` also drives the clamp, the LLM
@@ -169,6 +250,22 @@ class Segment:
     # are pace-derived-target concepts; a directly-typed BPM has nothing to
     # be swayed or clamped toward).
     literal_bpm: bool = False
+    # Identifies which "Repeat the following Nx:" block (if any) this
+    # segment came from, and which occurrence (0-based) within it - set by
+    # _expand_repeat_blocks, consumed by the merge pass in parse_workout
+    # that combines a too-short repeat body's segments (see that pass's own
+    # doc comment for why: a body of several short alternating-pace
+    # segments, e.g. "0.25mi at 7:15/mi, 0.25mi at 8:15/mi" repeated 3x,
+    # otherwise gets only ONE real track pick for the first occurrence,
+    # which overshoots so far that its carry silently skips every other
+    # occurrence's own segment entirely). None for a segment that wasn't
+    # part of any repeat block.
+    repeat_group: int | None = None
+    rep_index: int | None = None
+    # A timed all-out effort with no stated pace ("60s running hard uphill",
+    # strides, sprints) — build_workout_playlist targets the TOP of the
+    # Settings "work" BPM range (or 180) instead of a pace-derived cadence.
+    max_effort: bool = False
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
@@ -185,6 +282,13 @@ _BPM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*bpm\b", re.IGNORECASE)
 # app's ±15s budget tolerance needs.
 _SEG_SEC_RE = re.compile(r"(\d+)\s*s\b", re.IGNORECASE)
 _DIST_RE = re.compile(r"([\d.]+)\s*mi\b")
+# "60s running hard uphill" / "20 sec strides" — a timed step.
+_TIMED_SEC_RE = re.compile(r"(\d+)\s*(?:s|sec|secs|seconds)\b", re.IGNORECASE)
+# Effort words meaning "as hard as you can" when no pace is given.
+_MAX_EFFORT_RE = re.compile(r"\b(?:hard|uphill|hills?|sprints?|strides?|max(?:imum)?|all[\s-]?out|fast)\b", re.IGNORECASE)
+# Nominal pace for a max-effort step — only keeps the pace-based merge/
+# ordering logic working; its BPM target comes from max_effort instead.
+MAX_EFFORT_PACE_SEC = 390.0
 _REST_RE = re.compile(r"(\d+)\s*(s|sec|secs|min|mins?)\b[^,]*\b(?:rest|walk)", re.IGNORECASE)
 # A "no faster than X/mi" (or "or slower") clause is a ceiling on an
 # easy/warmup/cooldown step, not its target pace - matching it as the
@@ -250,7 +354,15 @@ def _is_segment_line(line: str) -> bool:
     )
 
 
-def _expand_repeat_blocks(lines: list[str]) -> list[str]:
+_repeat_group_counter_holder = {"next": 0}
+
+
+def _next_repeat_group_id() -> int:
+    _repeat_group_counter_holder["next"] += 1
+    return _repeat_group_counter_holder["next"]
+
+
+def _expand_repeat_blocks(lines: list[str]) -> list[tuple[str, int | None, int | None]]:
     """Expand a repeat-block header ("5 reps of:" / "Repeat the following
     3x:") into N literal copies of its body, so the rest of the parser sees
     a flat list exactly as if the block had been written out longhand.
@@ -268,14 +380,22 @@ def _expand_repeat_blocks(lines: list[str]) -> list[str]:
     following top-level line (e.g. a cooldown) by line count alone - only
     the fence (or, without one, the next single non-blank line) marks where
     the body ends.
+
+    Returns (text, repeat_group, rep_index) triples instead of plain text -
+    repeat_group is a fresh id per repeat-block instance (None for a line
+    outside any block), rep_index is which occurrence (0-based) within that
+    block the line belongs to. parse_workout copies these onto each Segment
+    it builds, and a later merge pass in that function uses them to combine
+    a too-short repeat body's segments into one real track-fillable segment
+    per occurrence (see that pass's own doc comment).
     """
-    out: list[str] = []
+    out: list[tuple[str, int | None, int | None]] = []
     i = 0
     while i < len(lines):
         line = lines[i].strip()
         m = _REPS_RE.match(line)
         if not m:
-            out.append(lines[i])
+            out.append((lines[i], None, None))
             i += 1
             continue
         count = int(m.group(1) or m.group(2))
@@ -320,12 +440,13 @@ def _expand_repeat_blocks(lines: list[str]) -> list[str]:
                 # sign the reps or rests exist at all - tag the first line of
                 # each rep with "Nx ..." up front so it's clear this block
                 # was picked up and merged, not missed.
+                group_id = _next_repeat_group_id() if count > 1 else None
                 for rep in range(max(count, 0)):
                     for idx, body in enumerate(body_lines):
                         if idx == 0 and count > 1:
-                            out.append(f"{count}x {body}")
+                            out.append((f"{count}x {body}", group_id, rep))
                         else:
-                            out.append(body)
+                            out.append((body, group_id, rep))
                 i = k
                 continue
             # Fence with no recognizable segment lines inside it - fall
@@ -333,11 +454,37 @@ def _expand_repeat_blocks(lines: list[str]) -> list[str]:
             i = j
             continue
 
+        # Several "•" lines straight after the header (no "-----" fence) are
+        # ALL the rep's body — e.g. "2 reps of: • 60s hard uphill… •
+        # 30s hard uphill…" — not just the first one (the second used to be
+        # read as a separate one-off step after the block).
+        bullets: list[str] = []
+        k = j
+        while k < len(lines):
+            st = lines[k].strip()
+            if not st:
+                k += 1
+                continue
+            if not st.startswith("•") or not _is_segment_line(st):
+                break
+            bullets.append(st.lstrip("•").strip())
+            k += 1
+        if len(bullets) >= 2:
+            group_id = _next_repeat_group_id() if count > 1 else None
+            for rep in range(max(count, 0)):
+                for idx, body in enumerate(bullets):
+                    out.append((f"{count}x {body}" if idx == 0 and count > 1 else body, group_id, rep))
+            i = k
+            continue
+
         if j < len(lines) and _is_segment_line(lines[j].strip()):
             body = lines[j].strip().lstrip("•").strip()
             tagged = f"{count}x {body}" if count > 1 else body
             for _ in range(max(count, 0)):
-                out.append(tagged)
+                # No repeat_group here - this is the single-compound-line
+                # body style (one segment per rep, not an alternating pair),
+                # so there's nothing for the merge pass below to combine.
+                out.append((tagged, None, None))
             i = j + 1
         else:
             i = j
@@ -347,7 +494,7 @@ def _expand_repeat_blocks(lines: list[str]) -> list[str]:
 def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) -> list[Segment]:
     """Parse Runna segment lines into Segments (rest parts split out)."""
     segments: list[Segment] = []
-    for raw in _expand_repeat_blocks(lines):
+    for raw, repeat_group, rep_index in _expand_repeat_blocks(lines):
         line = raw.strip().lstrip("•").strip()
         if not line or not _is_segment_line(line):
             continue
@@ -373,7 +520,11 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
                 # "work": the tight, symmetric BPM_TOLERANCES band — a
                 # literal target BPM is exactly the "hard effort, pace
                 # really counts" case that tolerance band exists for.
-                segments.append(Segment(run_part, "work", duration, None, bpm=float(bpm_m.group(1)), literal_bpm=True))
+                literal_bpm_val = float(bpm_m.group(1))
+                segments.append(Segment(
+                    run_part, "work", duration, None, bpm=literal_bpm_val, raw_bpm=literal_bpm_val, literal_bpm=True,
+                    repeat_group=repeat_group, rep_index=rep_index,
+                ))
             continue
 
         ceiling_m = _PACE_CEILING_RE.search(run_part)
@@ -392,21 +543,35 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
             pace = (int(ceiling_pace_m.group(1)) * 60 + int(ceiling_pace_m.group(2))) if ceiling_pace_m else easy_pace_sec
         else:
             pace = easy_pace_sec
+        max_effort = False
         if dist_m:
             duration = float(dist_m.group(1)) * pace
         else:
             dur_m = re.search(r"(\d+)\s*min", run_part)
             duration = int(dur_m.group(1)) * 60 if dur_m else 0
+            # Timed effort with no distance — "60s running hard uphill",
+            # "20s strides". Hard/uphill/sprint wording with no stated pace
+            # = maximum effort.
+            if duration == 0:
+                sec_m = _TIMED_SEC_RE.search(run_part)
+                if sec_m:
+                    duration = int(sec_m.group(1))
+                    if not pace_m and _MAX_EFFORT_RE.search(run_part):
+                        max_effort = True
+                        pace = MAX_EFFORT_PACE_SEC
 
         if duration > 0:
-            kind = _segment_kind(run_part)
+            kind = "work" if max_effort else _segment_kind(run_part)
             # A step with no stated pace runs at the conversational default —
             # treat it as easy effort, not a hard "work" interval.
-            if kind == "work" and not pace_m:
+            if kind == "work" and not pace_m and not max_effort:
                 kind = "easy"
             # Strength has no pace: pace_sec None leaves seg.bpm unset, so
             # tracks match on energy alone (any BPM).
-            segments.append(Segment(run_part, kind, duration, None if kind == "strength" else pace))
+            segments.append(Segment(
+                run_part, kind, duration, None if kind == "strength" else pace,
+                repeat_group=repeat_group, rep_index=rep_index, max_effort=max_effort,
+            ))
 
         if rest_m:
             value = int(rest_m.group(1))
@@ -419,22 +584,158 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
             rest_pace = easy_pace_sec
             if "walk" in rest_m.group(0).lower():
                 rest_pace = max(rest_pace, WALKING_REST_MIN_PACE_SEC)
-            segments.append(Segment(rest_m.group(0), "rest", rest_sec, rest_pace))
+            if max_effort and repeat_group is not None:
+                # Inside a repeat block of short all-out efforts the rests and
+                # the "easy jog back down" (not timed by Runna — estimated at
+                # the same time as the effort: the user's own estimate for
+                # 2x [60s up + 30s walk, 30s up + 20s walk] was 7:40, which
+                # this gives exactly) belong to the rep: the whole block is then
+                # merged below into one maximum-effort segment.
+                if re.search(r"jog\s+back", line, re.IGNORECASE):
+                    rest_sec += round(duration * 1.0)
+                segments.append(Segment(rest_m.group(0), "work", rest_sec, MAX_EFFORT_PACE_SEC,
+                                        repeat_group=repeat_group, rep_index=rep_index, max_effort=True))
+            else:
+                segments.append(Segment(rest_m.group(0), "rest", rest_sec, rest_pace))
 
-    # Music plays through short rests - fold them into the previous segment's
+    # A repeat block whose body is SEVERAL short, alternating-pace segments
+    # (e.g. "Repeat the following 3x: 0.25mi at 7:15/mi, 0.25mi at 8:15/mi")
+    # otherwise gets only ONE real track pick for the first occurrence of
+    # the first pace - that track overshoots the tiny (~109s) budget so far
+    # (a real song runs minutes, not under two) that the leftover carry
+    # silently skips every OTHER occurrence's segment outright, so the
+    # chart/mix only ever shows ~1 strip per unique pace in the block
+    # instead of all 3 reps (confirmed live, exact report: a real 3x
+    # [0.25mi@7:15/mi, 0.25mi@8:15/mi] workout produced only one 7:15
+    # track covering 5.4min against a combined 1.8min target before carry
+    # ate the next two segments). Fixed per the user's own specified rule:
+    #   1. Merge each occurrence's own segments into ONE segment at the
+    #      HARDEST (lowest pace_sec = fastest) pace in the group - the
+    #      combined DISTANCE of that occurrence's segments, run entirely at
+    #      that uplifted pace, giving a real duration budget per rep.
+    #   2. If even that per-occurrence duration is still too short to
+    #      reliably get a real track pick (< VERY_SHORT_SEGMENT_SEC), merge
+    #      ACROSS every occurrence in the group too, into one single big
+    #      segment covering the whole block's combined distance at the same
+    #      uplifted pace.
+    # A standalone rest segment (e.g. the "90s walking rest" after this
+    # block) is never part of a repeat_group, so it's untouched here and
+    # still gets folded/handled by the passes below exactly as before.
+    by_group: dict[int, list[Segment]] = {}
+    group_order: list[int] = []
+    for seg in segments:
+        if seg.repeat_group is None:
+            continue
+        if seg.repeat_group not in by_group:
+            by_group[seg.repeat_group] = []
+            group_order.append(seg.repeat_group)
+        by_group[seg.repeat_group].append(seg)
+
+    replacement: dict[int, list[Segment]] = {}
+    for gid in group_order:
+        group_segs = by_group[gid]
+        # Only pace-bearing, non-strength segments participate - a repeat
+        # block's body is always work/easy/etc with a real pace in
+        # practice, but guard against a stray segment with no pace_sec
+        # (e.g. strength) rather than dividing by it.
+        if any(s.pace_sec is None or s.pace_sec <= 0 for s in group_segs):
+            continue
+        uplifted_pace = min(s.pace_sec for s in group_segs)  # fastest = hardest = lowest sec/mi
+
+        by_rep: dict[int, list[Segment]] = {}
+        rep_order: list[int] = []
+        for s in group_segs:
+            r = s.rep_index if s.rep_index is not None else 0
+            if r not in by_rep:
+                by_rep[r] = []
+                rep_order.append(r)
+            by_rep[r].append(s)
+
+        def _merged_segment(segs: list[Segment], pace: float, label: str) -> Segment:
+            # Duration is the REAL combined time the runner actually spends
+            # on this ground - each segment's own original duration (at its
+            # own original pace), summed as-is. Only the BPM TARGET uses the
+            # uplifted pace (every segment in the merged group gets music
+            # matched to the group's hardest pace) - the time budget itself
+            # must stay the real-world total, not get recomputed shorter by
+            # re-deriving it from distance at the faster uplifted pace
+            # (confirmed against the user's own worked example: 0.25mi@
+            # 7:15/mi + 0.25mi@8:15/mi is a real ~3:53 on the ground, not
+            # the ~3:38 distance-at-uplifted-pace would give).
+            duration = sum(s.duration_sec for s in segs)
+            return Segment(label, "work", duration, pace, repeat_group=gid,
+                           max_effort=any(s.max_effort for s in segs))
+
+        # One shared, rep-independent label built from a single occurrence's
+        # own segments (e.g. "0.25mi at 7:15/mi + 0.25mi at 8:15/mi") - used
+        # for every per-rep merged segment, and reused (with a "Nx" prefix)
+        # if the whole-block fallback below is needed too.
+        rep_label = " + ".join(s.label.split("x ", 1)[-1] for s in by_rep[rep_order[0]])
+        per_rep_merged = [_merged_segment(by_rep[r], uplifted_pace, rep_label) for r in rep_order]
+
+        if per_rep_merged and min(s.duration_sec for s in per_rep_merged) < VERY_SHORT_SEGMENT_SEC:
+            # Still too short per-occurrence even after merging each rep's
+            # own pair - merge every occurrence in the block together too.
+            count = len(rep_order)
+            whole_label = f"{count}x {rep_label}" if count > 1 else rep_label
+            replacement[gid] = [_merged_segment(group_segs, uplifted_pace, whole_label)]
+        else:
+            replacement[gid] = per_rep_merged
+
+    if replacement:
+        rebuilt: list[Segment] = []
+        seen_groups: set[int] = set()
+        for seg in segments:
+            if seg.repeat_group is None:
+                rebuilt.append(seg)
+                continue
+            if seg.repeat_group in seen_groups:
+                continue  # already emitted this group's replacement segment(s)
+            seen_groups.add(seg.repeat_group)
+            rebuilt.extend(replacement.get(seg.repeat_group, [seg]))
+        segments = rebuilt
+
+    # Music plays through short rests - fold them into an adjacent segment's
     # track-fill pass (a standalone segment this short would force an early,
     # cut-off track change just for the rest). The label still records the
     # fold so downstream UI (e.g. the activity timeline strip) can show the
-    # rest as its own block even though it shares tracks with what preceded it.
+    # rest as its own block even though it shares tracks with what it folded
+    # into.
+    #
+    # Direction: folds FORWARD into the next segment when that next segment
+    # is an easier kind (easy/cooldown/rest) - a rest is itself a recovery
+    # moment, so it belongs with whatever slower effort follows it, not
+    # tacked onto the tail of a hard interval that just finished (confirmed
+    # live: a 90s walking rest after the last rep of a fast interval block,
+    # immediately followed by a conversational-pace cooldown, was folding
+    # BACKWARD into the interval - extending its already-hard-pace segment's
+    # duration rather than becoming part of the cooldown it's actually
+    # transitioning into). Only falls back to the OLD backward-fold (into
+    # whatever preceded it) when there's no next segment, or the next
+    # segment isn't easier (e.g. a rest sitting between two work intervals,
+    # where there's no genuinely "easier" neighbor to prefer).
     merged: list[Segment] = []
-    for seg in segments:
-        if seg.kind == "rest" and seg.duration_sec < 120 and merged:
-            merged[-1].duration_sec += seg.duration_sec
-            merged[-1].label = f"{merged[-1].label} + {seg.label}"
-            merged[-1].folded_rest_sec += seg.duration_sec
-            merged[-1].folded_rest_pace_sec = seg.pace_sec
-        else:
-            merged.append(seg)
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        if seg.kind == "rest" and seg.duration_sec < 120:
+            nxt = segments[i + 1] if i + 1 < len(segments) else None
+            if nxt is not None and nxt.kind in ("easy", "cooldown", "rest"):
+                nxt.duration_sec += seg.duration_sec
+                nxt.label = f"{seg.label} + {nxt.label}"
+                nxt.folded_rest_sec += seg.duration_sec
+                nxt.folded_rest_pace_sec = seg.pace_sec
+                i += 1
+                continue
+            if merged:
+                merged[-1].duration_sec += seg.duration_sec
+                merged[-1].label = f"{merged[-1].label} + {seg.label}"
+                merged[-1].folded_rest_sec += seg.duration_sec
+                merged[-1].folded_rest_pace_sec = seg.pace_sec
+                i += 1
+                continue
+        merged.append(seg)
+        i += 1
 
     # A "work" segment shorter than VERY_SHORT_SEGMENT_SEC (e.g. a 0.10mi
     # sprint rep, ~40s) can't be covered start-to-finish by any real track —
@@ -474,7 +775,25 @@ def parse_workout(lines: list[str], easy_pace_sec: float = DEFAULT_EASY_PACE) ->
 # ── Pace -> BPM ──────────────────────────────────────────────────────────────
 
 def garmin_cadence_buckets(db_path: str) -> dict[int, float]:
-    """5-second pace bucket -> avg SPM, same query the Running app uses."""
+    """5-second pace bucket -> avg SPM, same query the Running app uses.
+
+    UNFILTERED by effort/segment kind - averages cadence across every type
+    of run at a given pace, from an easy jog to a hard interval that merely
+    passed through that pace band transiently (e.g. mid-warmup or a brief
+    recovery). Confirmed live with real data: at ~8:50/mi this returns
+    ~172-173 SPM (dominated by the much larger volume of faster-workout
+    samples that pass through that pace band), but genuine easy-run samples
+    at that same pace cluster closer to ~168 SPM - cadence at race/work
+    effort is measurably higher than cadence at the same-ish pace during an
+    easy effort, so blending them pushes an easy segment's BPM target too
+    high, making the mixer pick faster music than the effort calls for and
+    the runner drift faster than planned (exactly this symptom, reported and
+    confirmed against two real runs: an easy 8:50/mi run measuring ~168 SPM
+    at that pace band, and a race at 8:00-8:30/mi measuring ~173-175 SPM).
+    Kept as the fallback for callers with no segment-kind context (or no
+    saved mix history to classify against) - see garmin_cadence_buckets_by_
+    kind below for the fix.
+    """
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as con:
         rows = con.execute(
             """SELECT CAST(3600.0 / r.speed / 5 AS INTEGER) * 5 AS bucket,
@@ -490,7 +809,234 @@ def garmin_cadence_buckets(db_path: str) -> dict[int, float]:
     return {int(b): float(s) for b, s in rows}
 
 
-def pace_to_bpm(pace_sec: float, cadence_buckets: dict[int, float] | None = None) -> float:
+# Mirrors app/api/garmin/run-pacing/route.ts's isEasySegment() exactly - a
+# segment's saved label (free text, e.g. "1mi warm up at a conversational
+# pace") is classified "easy" (warmup/conversational/cooldown/recovery/rest/
+# walk - allowed to run at any cadence without penalty) or "work" (an actual
+# interval/race effort). Kept in sync by hand since one side is TS and the
+# other Python - if this list changes, update that function too.
+def _is_easy_segment_label(label: str) -> bool:
+    t = label.lower()
+    return any(kw in t for kw in (
+        "warm up", "warmup", "cool down", "cooldown",
+        "conversational", "easy", "recovery", "rest", "walk",
+    ))
+
+# A kind's own bucket needs at least this many samples before it's trusted
+# over the unfiltered fallback - below this, one run's quirks (a single
+# brief easy stretch, say) could swing the whole bucket. Mirrors Settings ->
+# Pace Analysis's "Measured target pace -> outcome" chart's own
+# MIN_RELIABLE_SAMPLES (app/api/settings/bpm-pace-chart/route.ts) - this
+# function and that chart are now the SAME pipeline (pace-consistency
+# filter + sample-weighted rolling smoothing), kept in sync by hand across
+# the TS/Python boundary, so the mixer's actual BPM target for a pace and
+# what the chart displays for that same pace should agree.
+_KIND_BUCKET_MIN_SAMPLES = 5
+# A track's play window only counts as one real, steady-state cadence
+# sample if the pace stayed roughly constant throughout it - a window that
+# spans a pace CHANGE (e.g. a fast interval running into a walking rest
+# folded into the same segment, or a transition between two segments) is
+# neither a clean "work" sample nor a clean "easy" one, and blending it in
+# skews the cadence average toward nonsense (confirmed live: a "4x 0.5mi at
+# 8:20/mi... + 90s walking rest" label matched the "rest"/"walk" keywords
+# and got called easy, but its track window spanned the fast interval AND
+# the walking rest, dragging that bucket's average cadence down). Checked
+# via coefficient of variation (stdev / mean) on the window's own per-
+# sample instantaneous pace - unitless, so the same threshold works at any
+# speed, same rule and same threshold as the TS chart's own MAX_PACE_CV.
+_MAX_PACE_CV = 0.08
+# ±2 buckets (±10s/mi), sample-count-weighted rolling average - smooths out
+# a single bucket's own small-sample noise while still tracking real trend
+# shifts. Same ROLLING_WINDOW_BUCKETS the TS chart uses.
+_ROLLING_WINDOW_BUCKETS = 2
+_BUCKET_WIDTH_SEC = 5
+
+
+def garmin_cadence_buckets_by_kind(db_path: str, app_root: str) -> dict[str, dict[int, float]]:
+    """Like garmin_cadence_buckets, but split into "easy" and "work" cadence
+    profiles by cross-referencing GarminDB's activity_records against this
+    app's own saved "Today's Run" mix history (pacesync.db) - GarminDB
+    itself has no concept of a Runna workout segment, so kind classification
+    can only come from the saved tracklist's own segment labels.
+
+    THE SAME PIPELINE as Settings -> Pace Analysis's "Measured target pace
+    -> outcome" chart (app/api/settings/bpm-pace-chart/route.ts): bucketed
+    by each track's own TARGET pace (not the measured actual), a track's
+    play window is discarded if its pace wasn't steady throughout (pace-
+    consistency filter, _MAX_PACE_CV), and each bucket's raw average is
+    smoothed via a sample-count-weighted rolling average over its
+    neighboring buckets (_ROLLING_WINDOW_BUCKETS). Kept in sync BY HAND
+    across the TS/Python boundary - if one changes, the other must too, or
+    the mixer's actual BPM target for a given pace will quietly diverge from
+    what the chart displays for that same pace again.
+
+    Returns {"easy": {bucket: avg_spm}, "work": {bucket: avg_spm}} - a kind
+    with too few RAW samples in a given bucket (< _KIND_BUCKET_MIN_SAMPLES)
+    simply has no entry for that bucket at all (even post-smoothing), so
+    callers should fall back to garmin_cadence_buckets' unfiltered result
+    for any bucket missing here. Best-effort: returns {} on any failure
+    (missing pacesync.db, no confirmed history yet, etc.) so callers always
+    have the unfiltered function to fall back to.
+    """
+    import os
+
+    pacesync_path = os.path.join(app_root, "pacesync.db")
+    if not os.path.exists(pacesync_path):
+        return {}
+
+    try:
+        with sqlite3.connect(f"file:{pacesync_path}?mode=ro", uri=True) as sync_con:
+            entries = sync_con.execute(
+                "SELECT date, tracks_json FROM todays_run_history WHERE approved IS NULL OR approved != 0"
+            ).fetchall()
+    except Exception:
+        return {}
+    if not entries:
+        return {}
+
+    import json as _json
+
+    samples: dict[str, list[tuple[int, float]]] = {"easy": [], "work": []}
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as garmin_con:
+            garmin_con.row_factory = sqlite3.Row
+            for date, tracks_json in entries:
+                activity = garmin_con.execute(
+                    """SELECT activity_id, start_time FROM activities
+                       WHERE LOWER(sport) LIKE '%running%' AND DATE(start_time) = ?
+                       ORDER BY distance DESC LIMIT 1""",
+                    (date,),
+                ).fetchone()
+                if not activity:
+                    continue
+                records = garmin_con.execute(
+                    """SELECT timestamp, speed, cadence FROM activity_records
+                       WHERE activity_id = ? AND speed IS NOT NULL ORDER BY timestamp""",
+                    (activity["activity_id"],),
+                ).fetchall()
+                if not records:
+                    continue
+
+                import datetime
+
+                start_dt = datetime.datetime.fromisoformat(activity["start_time"].replace(" ", "T"))
+                record_samples = []
+                for r in records:
+                    try:
+                        t = (datetime.datetime.fromisoformat(r["timestamp"].replace(" ", "T")) - start_dt).total_seconds()
+                    except ValueError:
+                        continue
+                    if t < 0:
+                        continue
+                    record_samples.append((t, r["speed"], r["cadence"]))
+                if not record_samples:
+                    continue
+                run_end_sec = record_samples[-1][0]
+
+                try:
+                    tracks = _json.loads(tracks_json)
+                except (ValueError, TypeError):
+                    continue
+                for track in tracks:
+                    tempo = track.get("tempo")
+                    starts_at = track.get("startsAtSec")
+                    duration = track.get("durationSec")
+                    segment_label = track.get("segment") or ""
+                    target_pace_sec = track.get("targetPaceSec")
+                    if tempo is None or tempo <= 0 or starts_at is None or not duration or target_pace_sec is None:
+                        continue
+                    if starts_at >= run_end_sec - 15:
+                        continue
+                    window_end = min(starts_at + duration, run_end_sec)
+                    in_window = [
+                        (t, mph, cadence) for t, mph, cadence in record_samples
+                        if starts_at <= t < window_end and mph is not None and mph > 0.5
+                    ]
+                    if len(in_window) < 5:
+                        continue
+
+                    # Discard any window whose pace wasn't steady throughout
+                    # - see _MAX_PACE_CV's own doc comment above. Same rule
+                    # as the TS chart's own pace-consistency filter.
+                    inst_paces = [3600 / mph for _, mph, _ in in_window]
+                    mean_pace = sum(inst_paces) / len(inst_paces)
+                    variance = sum((p - mean_pace) ** 2 for p in inst_paces) / len(inst_paces)
+                    pace_cv = (variance ** 0.5) / mean_pace if mean_pace else 0
+                    if pace_cv > _MAX_PACE_CV:
+                        continue
+
+                    cadence_samples = [c for _, _, c in in_window if c is not None and c > 10]
+                    if len(cadence_samples) < 5:
+                        continue
+                    avg_spm = sum(c * 2 for c in cadence_samples) / len(cadence_samples)
+                    kind = "easy" if _is_easy_segment_label(segment_label) else "work"
+                    # Bucketed by the segment's own TARGET pace (not the
+                    # measured actual) - same key the TS chart's own
+                    # pace_to_bpm lookup is keyed by (a target pace is known
+                    # in advance; pace_to_bpm's whole job is "given a target
+                    # pace, what cadence should I aim for", so the lookup
+                    # table must be indexed by target, not outcome).
+                    bucket = round(target_pace_sec / _BUCKET_WIDTH_SEC) * _BUCKET_WIDTH_SEC
+                    samples[kind].append((bucket, avg_spm))
+    except Exception:
+        return {}
+
+    raw: dict[str, dict[int, float]] = {}
+    counts: dict[str, dict[int, int]] = {}
+    for kind, pairs in samples.items():
+        by_bucket: dict[int, list[float]] = {}
+        for bucket, spm in pairs:
+            by_bucket.setdefault(bucket, []).append(spm)
+        raw[kind] = {bucket: sum(spms) / len(spms) for bucket, spms in by_bucket.items()}
+        counts[kind] = {bucket: len(spms) for bucket, spms in by_bucket.items()}
+
+    # Sample-count-weighted rolling average over ±_ROLLING_WINDOW_BUCKETS
+    # neighbors, same smoothing the TS chart applies - a 1-sample bucket
+    # barely nudges the smoothed value while a 40-sample one dominates it,
+    # so a near-empty bucket can't distort its neighbors as much as a
+    # well-sampled one. Only a bucket that clears _KIND_BUCKET_MIN_SAMPLES
+    # on ITS OWN RAW count is published at all (same floor as before) - the
+    # smoothing softens noise within an already-trusted bucket, it isn't
+    # what makes a sparse bucket trustworthy in the first place.
+    result: dict[str, dict[int, float]] = {}
+    for kind in raw:
+        result[kind] = {}
+        for bucket, count in counts[kind].items():
+            if count < _KIND_BUCKET_MIN_SAMPLES:
+                continue
+            weighted_sum, weight_total = 0.0, 0
+            for d in range(-_ROLLING_WINDOW_BUCKETS, _ROLLING_WINDOW_BUCKETS + 1):
+                neighbor_bucket = bucket + d * _BUCKET_WIDTH_SEC
+                neighbor_spm = raw[kind].get(neighbor_bucket)
+                neighbor_count = counts[kind].get(neighbor_bucket, 0)
+                if neighbor_spm is None or neighbor_count == 0:
+                    continue
+                weighted_sum += neighbor_spm * neighbor_count
+                weight_total += neighbor_count
+            result[kind][bucket] = weighted_sum / weight_total if weight_total > 0 else raw[kind][bucket]
+    return result
+
+
+def pace_to_bpm(
+    pace_sec: float, cadence_buckets: dict[int, float] | None = None,
+    kind_buckets: dict[str, dict[int, float]] | None = None, kind: str | None = None,
+) -> float:
+    # Kind-specific cadence (garmin_cadence_buckets_by_kind) wins when
+    # available for this kind/pace - unfiltered cadence_buckets blends easy
+    # and hard-effort samples together, which measurably skews toward the
+    # higher cadence hard efforts carry even when they only pass THROUGH an
+    # easy-ish pace band transiently (confirmed live: ~168 SPM for a genuine
+    # easy 8:50/mi run vs. ~172-173 SPM in the unfiltered all-efforts
+    # aggregate at the same pace). Falls back to the unfiltered buckets
+    # (then the formula) for any kind/bucket the kind-specific data doesn't
+    # cover yet - a sparse kind_buckets is expected early on, before enough
+    # confirmed runs of that kind exist.
+    if kind_buckets and kind:
+        bucket_map = kind_buckets.get(kind)
+        if bucket_map:
+            bucket = min(bucket_map, key=lambda b: abs(b - pace_sec))
+            if abs(bucket - pace_sec) <= 15:
+                return round(bucket_map[bucket])
     if cadence_buckets:
         bucket = min(cadence_buckets, key=lambda b: abs(b - pace_sec))
         if abs(bucket - pace_sec) <= 15:
@@ -869,12 +1415,53 @@ def _fit_duration_precise(ordered: pd.DataFrame, budget_sec: float, overshoot: b
     return ordered.iloc[sorted(best)]
 
 
+_REPEAT_PREFIX_RE = re.compile(r"^\d+x\s+", re.IGNORECASE)
+
+
+def _step_key(text: str) -> str:
+    """A workout line (or one part of a segment label) reduced to its run
+    part - bullet, "Nx " repeat prefix and trailing rest clause removed,
+    lower-cased, whitespace collapsed - so a source line and the segment(s)
+    parse_workout built from it compare equal."""
+    t = str(text).strip().lstrip("•").strip()
+    t = _REPEAT_PREFIX_RE.sub("", t)
+    m = _REST_RE.search(t)
+    if m:
+        t = t[: m.start()].rstrip(", ")
+    return " ".join(t.lower().split())
+
+
+def _resolve_line_candidates(segments: list[Segment], entries: list | None) -> list | None:
+    """Advanced AI DJ Mix sends its per-step candidate lists keyed by the
+    workout LINE ({"line", "uris"}) rather than by position, because
+    parse_workout doesn't map lines to segments 1:1 (a "3 reps of" block
+    becomes 3 segments, short rests fold into neighbours, header lines are
+    skipped). Converts them to the positional per-segment list the builder
+    uses: a segment takes the list of the line it came from (any part of a
+    merged "A + B" label, first match wins); no match = unrestricted.
+    Positional lists (Pace Pro) pass through unchanged."""
+    if not entries or not any(isinstance(e, dict) for e in entries):
+        return entries
+    keyed: dict[str, list[str]] = {}
+    for e in entries:
+        if isinstance(e, dict) and isinstance(e.get("uris"), list):
+            key = _step_key(e.get("line", ""))
+            if key and key not in keyed:
+                keyed[key] = e["uris"]
+    out: list[list[str] | None] = []
+    for seg in segments:
+        parts = [_step_key(part) for part in str(seg.label).split(" + ")]
+        out.append(next((keyed[k] for k in parts if k in keyed), None))
+    return out
+
+
 def build_workout_playlist(
     segments: list[Segment],
     library: pd.DataFrame,
     model: str,
     use_llm: bool = True,
     cadence_buckets: dict[int, float] | None = None,
+    kind_cadence_buckets: dict[str, dict[int, float]] | None = None,
     easy_bias_sec: float = 0.0,
     track_feedback: list[dict] | None = None,
     played_tracks: list[dict] | None = None,
@@ -942,6 +1529,8 @@ def build_workout_playlist(
     lib/pace-analysis.ts) and wants the LLM to choose only from those, not
     from every library track that happens to match the BPM window.
     """
+    segment_candidate_uris = _resolve_line_candidates(segments, segment_candidate_uris)
+
     # Tracks without a duration can't be time-budgeted — NaN would poison the
     # cumulative sums ("cannot convert float NaN to integer"). Drop them.
     if "Duration (ms)" in library.columns:
@@ -955,10 +1544,30 @@ def build_workout_playlist(
         # BPM segment - see Segment.literal_bpm's own doc comment.
         seg.sweet_bpm = None if seg.literal_bpm else _kind_bpm_sweet(seg.kind, bpm_overrides)
         if seg.pace_sec:
+            # BPM lookup always uses the segment's LITERAL target pace, never
+            # adjusted by easy_bias_sec (the "recent easy runs came out
+            # faster than target" auto-ease signal) - that adjustment used
+            # to shift the effective pace here before the cadence-bucket
+            # lookup, which made the mix's actual BPM target silently diverge
+            # from what Settings -> Pace Analysis's chart shows for the same
+            # target pace (confirmed live: an 8:55/mi segment with ANY
+            # nonzero bias landed in the chart's 170 BPM bucket instead of
+            # the chart's own displayed 167, since the shifted pace crossed
+            # into a different 5s bucket). easy_bias_sec still softens the
+            # ENERGY window in _segment_pool below (calmer music, same BPM) -
+            # only the BPM target itself is now exempt.
             pace = seg.pace_sec
-            if seg.kind in CHILL_KINDS:
-                pace += easy_bias_sec
-            seg.bpm = pace_to_bpm(pace, cadence_buckets)
+            # WIDE_TOLERANCE_KINDS (warmup/easy/cooldown/rest) maps to the
+            # "easy" cadence profile, "work" to the "work" one - same binary
+            # split _is_easy_segment_label/isEasySegment's own classification
+            # uses, chosen over 5 separate per-kind buckets since the
+            # confirmed-run dataset is small enough that finer slicing would
+            # mostly just produce empty buckets.
+            seg.bpm = pace_to_bpm(
+                pace, cadence_buckets, kind_buckets=kind_cadence_buckets,
+                kind="easy" if seg.kind in WIDE_TOLERANCE_KINDS else "work",
+            )
+            seg.raw_bpm = seg.bpm
             # Clamp the target into the run type's bounds so BPM matching
             # aims inside the window instead of fighting the hard filter.
             # Skipped under strict_pace_tolerance: that mode bypasses the
@@ -971,6 +1580,12 @@ def build_workout_playlist(
                     seg.bpm = min(seg.bpm, hi)
                 if seg.bpm and lo is not None:
                     seg.bpm = max(seg.bpm, lo)
+        if seg.max_effort:
+            # All-out effort: aim at the top of the Settings "work" range
+            # (180 if none is set), not a pace-derived cadence.
+            _lo, _hi = _kind_bpm_bounds("work", bpm_overrides)
+            seg.bpm = seg.raw_bpm = float(_hi) if _hi else 180.0
+            seg.sweet_bpm = None
 
     # Cover the workout's slowest projected duration rather than appending
     # arbitrary padding tracks: stretch the final segment's budget only by
@@ -1055,21 +1670,30 @@ def build_workout_playlist(
         avoid = set(avoid_tracks or [])
         played = _played_uris(seg.pace_sec) | avoid
         lib_for_seg = library[~library["Track URI"].isin(downvoted)] if downvoted else library
-        # _segment_pool's tolerance-widening loop stops the INSTANT it clears
-        # min_pool, even if far more close-BPM tracks exist just one tier
-        # out — with the old flat min_pool=20, a large library easily has
-        # 20+ tracks within the tightest (3 BPM) tolerance, so the loop
-        # returned right there and never considered the rest. For the
-        # "wide tolerance" kinds (easy/cooldown/rest/warmup — WIDE_TOLERANCE_
-        # KINDS above), pull the floor up to MAX_CANDIDATES itself so the
-        # search keeps widening until either it's seen every reasonably
-        # close track or run out of headroom, giving the LLM (and the
-        # deterministic fallback) the full available choice to sequence a
-        # tight, smoothly-transitioning segment from — not just the bare
-        # minimum needed to fill the time budget. "work" stays at 20: pace
-        # accuracy matters more than candidate breadth there, and its
-        # tolerance is already the tight, non-widening default.
-        seg_min_pool = MAX_CANDIDATES if seg.kind in WIDE_TOLERANCE_KINDS else 20
+
+        has_explicit_candidates = bool(
+            segment_candidate_uris and seg_idx < len(segment_candidate_uris) and segment_candidate_uris[seg_idx]
+        )
+        # Advanced AI DJ Mix's per-segment BPM range: the candidate list IS
+        # the user's BPM choice, so aim the segment at it — target = median
+        # effective tempo of the listed tracks (shown as the segment's
+        # target BPM, and what _segment_pool ranks by) — and drop the
+        # Settings run-type bounds below (confirmed live: a 166 BPM range on
+        # a "work" segment with a 170-180 Settings range was clamped empty,
+        # fell back to the full library and came out at 174). Pace Pro's
+        # strict mode keeps its own pace-derived target.
+        user_bpm_range = has_explicit_candidates and not strict_pace_tolerance and seg.bpm is not None
+        if user_bpm_range:
+            listed = library[library["Track URI"].isin(set(segment_candidate_uris[seg_idx]))]
+            if not listed.empty:
+                eff = listed["Tempo"].astype(float).map(_effective_run_tempo)
+                seg.bpm = seg.raw_bpm = float(round(eff.median()))
+                seg.sweet_bpm = None
+
+        # seg_bpm_bounds computed here (moved ahead of its original spot
+        # below `pool`) so the strict exact-BPM lock just below can respect
+        # the same kind ceiling/floor its step-out search widens within —
+        # see _exact_bpm_pool's own bpm_bounds param doc.
         if strict_pace_tolerance and seg.bpm:
             # Hard floor at target - tightest tolerance, no ceiling - same
             # rule lib/pace-analysis.ts's classifyPaceFit() judges "fits"
@@ -1088,8 +1712,84 @@ def build_workout_playlist(
             # empty. No kind-based bounds at all - the exact-match filter
             # below is the only constraint that should apply.
             seg_bpm_bounds = (None, None)
+        elif user_bpm_range:
+            seg_bpm_bounds = (None, None)
         else:
             seg_bpm_bounds = _kind_bpm_bounds(seg.kind, bpm_overrides)
+
+        # Every segment with a BPM target (every kind except strength, which
+        # has none) is locked to ONE exact whole-number BPM for its entire
+        # candidate pool before anything else runs — see _exact_bpm_pool's
+        # own doc comment. This replaces (not stacks with) _segment_pool's
+        # own tolerance-widening ladder for BPM specifically; energy/play-
+        # count/artist-dedup widening inside _segment_pool is unaffected,
+        # it just now operates on an already BPM-locked library.
+        #
+        # Locks to raw_bpm (the pace-derived target BEFORE the Settings
+        # ceiling/floor clamp), not the clamped seg.bpm — otherwise every
+        # segment whose real pace exceeds a kind's configured ceiling
+        # collapses onto that exact same clamped number (confirmed live: a
+        # "work" ceiling of 170 made literally every fast segment lock to
+        # 170 regardless of its actual pace). The Settings ceiling/floor
+        # still applies as a hard boundary (passed into _exact_bpm_pool's
+        # own step-out search, AND still enforced again by _segment_pool's
+        # bpm_bounds filter below) — it just no longer flattens the LOCK
+        # target itself onto one shared clamped value.
+        #
+        # SKIPPED entirely when this segment has its own explicit candidate
+        # list (segment_candidate_uris — Advanced AI DJ Mix's BPM-range
+        # picker, or Pace Pro's pace-analysis "fits" list): that list is
+        # itself the user's (or Pace Analysis's) own deliberate BPM choice,
+        # and locking lib_for_seg to the PACE-derived target first — before
+        # the candidate list even gets applied below — fought it outright
+        # (confirmed live: Advanced Mix asked for 168-168 BPM on an 8:55/mi
+        # easy segment, but the pace-derived lock had already collapsed
+        # lib_for_seg to 170 BPM; intersecting 168-only candidates against a
+        # 170-only library came back empty, which silently fell through to
+        # "widen to the full library" — except that fallback reused the
+        # already-170-locked lib_for_seg too, so the user's own 168 BPM
+        # choice was never actually reachable, and the mix came out at 170
+        # regardless of what was typed in). The explicit candidate list is
+        # applied against the UNLOCKED library instead — see seg_allowed_uris
+        # below — and is the only BPM constraint for this segment short of
+        # the kind's own Settings ceiling/floor (seg_bpm_bounds, still
+        # enforced via _segment_pool's bpm_bounds either way).
+        lock_bpm = seg.raw_bpm or seg.bpm
+        if lock_bpm and not has_explicit_candidates:
+            lib_for_seg = _exact_bpm_pool(lib_for_seg, lock_bpm, bpm_bounds=seg_bpm_bounds)
+        # _segment_pool's tolerance-widening loop stops the INSTANT it clears
+        # min_pool, even if far more close-BPM tracks exist just one tier
+        # out — with the old flat min_pool=20, a large library easily has
+        # 20+ tracks within the tightest (3 BPM) tolerance, so the loop
+        # returned right there and never considered the rest. For the
+        # "wide tolerance" kinds (easy/cooldown/rest/warmup — WIDE_TOLERANCE_
+        # KINDS above), pull the floor up to MAX_CANDIDATES itself so the
+        # search keeps widening until either it's seen every reasonably
+        # close track or run out of headroom, giving the LLM (and the
+        # deterministic fallback) the full available choice to sequence a
+        # tight, smoothly-transitioning segment from — not just the bare
+        # minimum needed to fill the time budget. "work" stays at 20: pace
+        # accuracy matters more than candidate breadth there, and its
+        # tolerance is already the tight, non-widening default.
+        #
+        # Moot once lib_for_seg was locked to one exact BPM above — guarded
+        # by the SAME has_explicit_candidates check the lock itself used, so
+        # a segment whose lock was skipped (explicit candidate list) still
+        # gets the normal kind-based breadth floor, not the locked-pool-only
+        # floor of 1. _segment_pool's own BPM tolerance ladder can't widen a
+        # pool that's already a single BPM's worth of tracks, so demanding a
+        # breadth floor from it (MAX_CANDIDATES, or even the old flat 20)
+        # would fail segments whose exact-BPM pool has genuinely fewer
+        # tracks than that but still easily covers the duration budget on
+        # its own — exactly
+        # backwards for a "strictly one BPM" ask, where the point is to
+        # accept whatever that one BPM actually has, not demand artificial
+        # breadth from it (confirmed: this only actually bites with play-
+        # count tiering OFF — see _fills_budget's own `if max_plays is
+        # None: len(pool) < min_pool` gate, which tiering normally skips
+        # entirely). The duration-budget check in _fills_budget is still the
+        # real gate either way.
+        seg_min_pool = 1 if (seg.bpm and not has_explicit_candidates) else (MAX_CANDIDATES if seg.kind in WIDE_TOLERANCE_KINDS else 20)
 
         seg_allowed_uris = segment_candidate_uris[seg_idx] if segment_candidate_uris and seg_idx < len(segment_candidate_uris) else None
         pool = pd.DataFrame()
@@ -1118,34 +1818,6 @@ def build_workout_playlist(
                 bpm_bounds=seg_bpm_bounds, avoid=avoid or None,
                 sweet_bpm=seg.sweet_bpm,
             )
-        if seg.literal_bpm and seg.bpm and not pool.empty:
-            # AI Remix asks for tracks AT this BPM, not merely close to it —
-            # BPM_TOLERANCES above (±3-8) is the right width for a workout
-            # segment's pace-derived cadence target (some slack is fine, the
-            # LLM leans toward the top-ranked/closest anyway), but a
-            # literal, directly-typed target reads as a precise, non-
-            # negotiable ask. Narrow the pool to only tracks whose RAW tempo,
-            # doubled, or halved rounds to exactly seg.bpm — a half/double-
-            # time track genuinely plays at the target cadence once halved/
-            # doubled, so it's a real match, not just a close one (NOT the
-            # same rule as replace-candidates-budget/route.ts's isExactBpm,
-            # which is plain round(tempo)==round(target) with no half/double-
-            # time symmetry — a prior version of this comment wrongly claimed
-            # they matched). Deliberately NO fallback to a tolerance-widened
-            # pool when nothing matches exactly — a near-miss (e.g. 170 when
-            # 168 was asked for) silently returned instead of the segment
-            # just coming back empty defeats the entire point of a literal
-            # BPM ask; the segment is skipped instead (same as genuinely
-            # having no candidates at all).
-            target_rounded = round(seg.bpm)
-            exact = pool["Tempo"].map(
-                lambda t: target_rounded in (round(float(t)), round(float(t) * 2), round(float(t) / 2))
-            )
-            if exact.any():
-                pool = pool[exact]
-            else:
-                _log(f"'{seg.label}': no track rounds to exactly {seg.bpm:.0f} BPM — segment will be empty")
-                pool = pool.iloc[0:0]
         if pool.empty:
             _log(f"No tracks fit segment '{seg.label}' - skipping.")
             continue
