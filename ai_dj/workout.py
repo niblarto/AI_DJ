@@ -187,6 +187,27 @@ def _kind_bpm_sweet(kind: str, overrides: dict | None) -> float | None:
             return None
     return None
 
+
+# Settings' per-pace BPMs for "work" segments run 6:50-8:55/mi in 5s steps.
+PACE_BPM_MIN_SEC = 410  # 6:50
+PACE_BPM_MAX_SEC = 535  # 8:55
+
+def _pace_fixed_bpm(pace_sec: float | None, overrides: dict | None) -> float | None:
+    """The BPM Settings assigns to this pace (snapped to the nearest 5s step),
+    or None when the pace is outside 6:50-8:55 or that step has no BPM set -
+    the segment then falls back to automatic cadence matching."""
+    table = (overrides or {}).get("paceBpm")
+    if not pace_sec or not isinstance(table, dict):
+        return None
+    if pace_sec < PACE_BPM_MIN_SEC - 2.5 or pace_sec > PACE_BPM_MAX_SEC + 2.5:
+        return None
+    snapped = min(max(int(round(pace_sec / 5.0)) * 5, PACE_BPM_MIN_SEC), PACE_BPM_MAX_SEC)
+    raw = table.get(f"{snapped // 60}:{snapped % 60:02d}")
+    try:
+        return float(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+
 # Thumbs up/down from the app applies to paces within this window (sec/mi):
 # a downvoted track is excluded from segments near that pace, an upvoted one
 # is pulled to the front of the segment's setlist.
@@ -266,6 +287,9 @@ class Segment:
     # strides, sprints) — build_workout_playlist targets the TOP of the
     # Settings "work" BPM range (or 180) instead of a pace-derived cadence.
     max_effort: bool = False
+    # Exact BPM Settings assigns to this segment's pace (_pace_fixed_bpm) -
+    # replaces the pace-derived cadence target and the kind min/max bounds.
+    fixed_bpm: float | None = None
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
@@ -1580,6 +1604,19 @@ def build_workout_playlist(
                     seg.bpm = min(seg.bpm, hi)
                 if seg.bpm and lo is not None:
                     seg.bpm = max(seg.bpm, lo)
+                # A Settings sweet spot IS the BPM this run type aims at: lock
+                # to it instead of the pace-derived cadence. Otherwise the
+                # exact-BPM lock below picks the pace's BPM (e.g. 168) first,
+                # leaving the sweet spot only a ranking nudge inside a pool
+                # that is already one BPM - so it never changed anything.
+                if seg.sweet_bpm and not seg.literal_bpm and not seg.max_effort:
+                    seg.bpm = seg.raw_bpm = seg.sweet_bpm
+                if seg.kind == "work" and not seg.literal_bpm and not seg.max_effort:
+                    fixed = _pace_fixed_bpm(seg.pace_sec, bpm_overrides)
+                    if fixed:
+                        seg.fixed_bpm = fixed
+                        seg.bpm = seg.raw_bpm = fixed
+                        seg.sweet_bpm = None
         if seg.max_effort:
             # All-out effort: aim at the top of the Settings "work" range
             # (180 if none is set), not a pace-derived cadence.
@@ -1712,7 +1749,7 @@ def build_workout_playlist(
             # empty. No kind-based bounds at all - the exact-match filter
             # below is the only constraint that should apply.
             seg_bpm_bounds = (None, None)
-        elif user_bpm_range:
+        elif user_bpm_range or seg.fixed_bpm:
             seg_bpm_bounds = (None, None)
         else:
             seg_bpm_bounds = _kind_bpm_bounds(seg.kind, bpm_overrides)
