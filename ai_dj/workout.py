@@ -116,6 +116,17 @@ _STRICT_BPM_MAX_STEP = 40
 def _exact_bpm_pool(
     library: pd.DataFrame, target_bpm: float, bpm_bounds: tuple[float | None, float | None] = (None, None),
 ) -> pd.DataFrame:
+    return _exact_bpm_search(library, target_bpm, bpm_bounds)[1]
+
+
+def _tempo_matches_bpm(tempo: float, bpm: int) -> bool:
+    """The exact-BPM rule: raw tempo, doubled or halved, rounds to the whole-number BPM."""
+    return bpm in (round(float(tempo)), round(float(tempo) * 2), round(float(tempo) / 2))
+
+
+def _exact_bpm_search(
+    library: pd.DataFrame, target_bpm: float, bpm_bounds: tuple[float | None, float | None] = (None, None),
+) -> tuple[int | None, pd.DataFrame]:
     """Every mix segment with a BPM target now gets EXACTLY one whole-number
     BPM for its entire candidate pool, not a tolerance band — restricts
     `library` to tracks whose raw tempo, doubled, or halved rounds to
@@ -150,15 +161,12 @@ def _exact_bpm_pool(
         return True
 
     def _at(bpm: int) -> pd.DataFrame:
-        match = library["Tempo"].map(
-            lambda t: bpm in (round(float(t)), round(float(t) * 2), round(float(t) / 2))
-        )
-        return library[match]
+        return library[library["Tempo"].map(lambda t: _tempo_matches_bpm(t, bpm))]
 
     if _in_bounds(target_rounded):
         pool = _at(target_rounded)
         if not pool.empty:
-            return pool
+            return target_rounded, pool
     for step in range(1, _STRICT_BPM_MAX_STEP + 1):
         for bpm in (target_rounded + step, target_rounded - step):
             if not _in_bounds(bpm):
@@ -166,8 +174,8 @@ def _exact_bpm_pool(
             pool = _at(bpm)
             if not pool.empty:
                 _log(f"No in-range tracks at exactly {target_rounded} BPM — widened to {bpm} BPM instead")
-                return pool
-    return library.iloc[0:0]
+                return bpm, pool
+    return None, library.iloc[0:0]
 
 
 def _kind_bpm_sweet(kind: str, overrides: dict | None) -> float | None:
@@ -1270,6 +1278,35 @@ def _segment_pool(
     return (last_pool if last_pool is not None else library).reset_index(drop=True)
 
 
+# Favourite tracks (Pace Pro / Race mixes only): a starred track at the segment's BPM is ALWAYS included,
+# ahead of every other consideration - play counts, played/avoided, thumbs-down, one-per-artist, the
+# candidate lists, the LLM's own picks. Only the BPM (exactly the same whole-number match every other track
+# in the segment gets) and the segment's length limit them: favourites are added while they still fit inside
+# the segment's time budget, and a favourite that wouldn't fit is left out rather than overrunning it.
+def _favourite_picks(
+    library: pd.DataFrame, seg: Segment, used: set, favourites: set, budget_sec: float, is_last: bool,
+    bpm: int | None = None,
+) -> pd.DataFrame:
+    # `bpm` is the one whole-number BPM the segment's other tracks are locked to (see _exact_bpm_search): a
+    # favourite qualifies only at exactly that BPM (half/double-time counted), never a nearby one.
+    if not favourites or bpm is None or "Track URI" not in library.columns:
+        return library.iloc[0:0]
+    fav = library[library["Track URI"].isin(favourites) & ~library["Track URI"].isin(used)].copy()
+    if fav.empty:
+        return fav
+    fav = fav[fav["Tempo"].map(lambda t: _tempo_matches_bpm(t, bpm))]
+    picked, cum = [], 0.0
+    for i, row in fav.iterrows():
+        dur = row["Duration (ms)"] / 1000
+        if budget_sec <= VERY_SHORT_SEGMENT_SEC:
+            picked.append(i)  # a tiny segment gets one real track that runs its natural length
+            break
+        if cum + dur <= budget_sec:
+            picked.append(i)
+            cum += dur
+    return fav.loc[picked]
+
+
 def _chain_order(pool: pd.DataFrame, anchor: pd.DataFrame | None) -> list[int]:
     """Pool indices ordered by greedy nearest-neighbour feel, starting from
     the track closest to the anchor (previous segment's last track)."""
@@ -1498,6 +1535,7 @@ def build_workout_playlist(
     on_llm=None,
     strict_pace_tolerance: bool = False,
     segment_candidate_uris: list[list[str] | None] | None = None,
+    favourite_uris: list[str] | None = None,
 ) -> pd.DataFrame:
     """Fill every segment with BPM-matched tracks; returns rows with a
     Segment label and cumulative timing columns.
@@ -1681,6 +1719,7 @@ def build_workout_playlist(
         except Exception:
             pass
 
+    favourite_set = set(favourite_uris or [])
     llm_failures: list[str] = []
     for seg_idx, seg in enumerate(segments):
         _progress(seg_idx, seg.label)
@@ -1792,6 +1831,9 @@ def build_workout_playlist(
         # the kind's own Settings ceiling/floor (seg_bpm_bounds, still
         # enforced via _segment_pool's bpm_bounds either way).
         lock_bpm = seg.raw_bpm or seg.bpm
+        fav_bpm: int | None = None
+        if lock_bpm and favourite_set:
+            fav_bpm = round(lock_bpm) if has_explicit_candidates else _exact_bpm_search(lib_for_seg, lock_bpm, bpm_bounds=seg_bpm_bounds)[0]
         if lock_bpm and not has_explicit_candidates:
             lib_for_seg = _exact_bpm_pool(lib_for_seg, lock_bpm, bpm_bounds=seg_bpm_bounds)
         # _segment_pool's tolerance-widening loop stops the INSTANT it clears
@@ -1971,7 +2013,22 @@ def build_workout_playlist(
         # tracks by one artist — keep only the first of each.
         ordered = ordered[~ordered["Artist Name(s)"].map(_primary_artist).duplicated()]
 
-        chosen = _fit_duration_precise(ordered, budget, overshoot=is_last).copy()
+        # Favourites (Pace Pro / Race mixes): the BPM-matching ones go in first; the rest of the budget is
+        # filled from the normal ordering, which then excludes them.
+        fav_chosen = _favourite_picks(library, seg, used, favourite_set, budget, is_last, fav_bpm)
+        if fav_chosen.empty:
+            chosen = _fit_duration_precise(ordered, budget, overshoot=is_last).copy()
+        else:
+            fav_sec = fav_chosen["Duration (ms)"].sum() / 1000
+            remaining = budget - fav_sec
+            rest = ordered[~ordered["Track URI"].isin(fav_chosen["Track URI"])]
+            fav_artists = set(fav_chosen["Artist Name(s)"].map(_primary_artist))
+            rest = rest[~rest["Artist Name(s)"].map(_primary_artist).isin(fav_artists)]
+            if remaining >= 30 or (is_last and remaining > 0):
+                chosen = pd.concat([fav_chosen, _fit_duration_precise(rest, remaining, overshoot=is_last)]).copy()
+            else:
+                chosen = fav_chosen.copy()
+            _log(f"'{seg.label}': {len(fav_chosen)} favourite(s) included ({fav_sec/60:.1f} min)")
         # Playback order within the segment: track *selection* above (LLM
         # picks / deterministic fallback, played/boosted demotion, artist
         # dedup, budget fit) is untouched — this only resequences the

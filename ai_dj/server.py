@@ -398,6 +398,9 @@ def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, in
     segment_candidate_uris = body.get("segmentCandidateUris")
     if not isinstance(segment_candidate_uris, list):
         segment_candidate_uris = None
+    favourite_uris = body.get("favouriteUris")
+    if not isinstance(favourite_uris, list):
+        favourite_uris = None
     try:
         playlist = build_workout_playlist(
             segments, library, model=model, use_llm=use_llm,
@@ -407,6 +410,7 @@ def _build_mix_payload(body: dict, progress=None, on_llm=None) -> tuple[dict, in
             effort=effort, progress=progress, on_llm=on_llm,
             strict_pace_tolerance=strict_pace_tolerance,
             segment_candidate_uris=segment_candidate_uris,
+            favourite_uris=favourite_uris,
         )
     except ValueError as e:
         return {"error": str(e)}, 422
